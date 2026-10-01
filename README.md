@@ -47,10 +47,30 @@ logs one warning and the tree stays on core grouping; the host half still runs.
 ## What the host half does
 
 **One hidden classification call per Session, on the first Human prompt.** The
-cadence is `session-title`'s own: the `session/event` stream, the
-`source.kind === 'user'` filter, and the "first eligible message" condition, read
-from a session projection so a process restart cannot restart the count. Subagent
-Sessions are ignored.
+eligibility predicate is `session-title`'s own: the `source.kind === 'user'`
+filter and the "first eligible message" condition, read from a session
+projection so a process restart cannot restart the count. Subagent Sessions are
+ignored.
+
+**The work runs when the Session's `request/header` is committed, not when the
+prompt is.** `packages/core/agent-loop/src/agent.ts` appends the first
+`user/message` at `:421` and only then calls `buildRequest` at `:425`, which
+appends the header carrying the Session's route — so at the instant a brand-new
+Session's first prompt exists, the Session has **no** logged route at all. The
+route, the prompt and every eligibility condition are therefore read at the one
+instant the route exists, from `session.requestHeader()` and from this plugin's
+own projection.
+
+**There is no wait and no timer.** A Session that never commits a
+`request/header` is a Session that never dispatched a request: it makes no call
+and records nothing, and it stays on core grouping — the contract's
+"no route → no call at all" branch. An earlier revision instead armed its work
+at the first `user/message` and kept it for a bounded 300 s; that arm could not
+be created at all while the plugin's storage unit was still opening, and the
+Session then recorded nothing **forever**, because the later header found no
+armed entry. Resolving at the header removes the window: a header that arrives
+while the plugin cannot act (storage still opening, feature disabled) simply
+classifies on the next one.
 
 Three properties are contractual:
 
@@ -66,7 +86,15 @@ Three properties are contractual:
   implemented.
 - **The route is never invented.** Config `provider`/`model`, else the Session's
   own logged route from its `request/header`, else **no call at all** and nothing
-  recorded. A half-configured pair is treated as unconfigured.
+  recorded. A half-configured pair is treated as unconfigured. **Measured truth
+  for the default path (2026-10-01, `dsh-session-workspaces-route`,
+  `127.0.0.1:3190`)**: with both fields left empty — the out-of-the-box default —
+  a brand-new Session whose first prompt is its first turn classifies from its
+  own logged route, with no Human override and no restart. On the previous
+  revision the same path was already reached in the plain case, but a first turn
+  whose prompt landed before the storage unit opened recorded nothing at all;
+  that case is now covered by `test/composition/route-ordering.spec.ts`, which
+  fails on the previous revision and passes on this one.
 
 The answer is validated against a **closed candidate set** — the directories under
 the Aweave `workspaces/` root (located from the Sessions' own working
