@@ -67,8 +67,14 @@ export interface Composition {
   session(id: string, overrides?: { readonly parent?: unknown; readonly cwd?: string | undefined }): StubSession
   /** Deliver one event to the plugin's own listener. */
   fire(session: StubSession, event: StubEvent): void
-  /** The projection state the plugin will read for the next `user/message`. */
-  projection(state: { count: number; seq: number | null } | undefined): void
+  /**
+   * Deliver one COMPLETE first turn the way the host does: the prompt first,
+   * then the `request/header` that carries its route (`agent.ts:421` then
+   * `:425`). `route` sets the Session's logged route before the header lands.
+   */
+  turn(session: StubSession, text: string, route?: { readonly provider: string; readonly model: string }): void
+  /** The projection state the plugin will read. */
+  projection(state: { count: number; seq: number | null; prompt: string | null } | undefined): void
   /** Wait until the plugin has opened its storage unit. */
   ready(): Promise<void>
   /** Let pending microtasks and timers settle. */
@@ -104,7 +110,11 @@ export async function boot(options: BootOptions = {}): Promise<Composition> {
     { type: 'finish', reason: { kind: 'stop' } },
   ] as readonly StreamChunk[]
   let scriptedThrow: string | undefined
-  let projection: { count: number; seq: number | null } | undefined = { count: 1, seq: 1 }
+  let projection: { count: number; seq: number | null; prompt: string | null } | undefined = {
+    count: 1,
+    seq: 1,
+    prompt: 'work on the k repo',
+  }
   const listeners: ((session: StubSession, event: StubEvent) => void)[] = []
 
   ctx.provide('storageDomain', {
@@ -214,6 +224,11 @@ export async function boot(options: BootOptions = {}): Promise<Composition> {
       return session
     },
     fire: (session, event) => { for (const listener of listeners) listener(session, event) },
+    turn: (session, text, route) => {
+      composition.fire(session, humanMessage(text))
+      if (route !== undefined) session.route = { provider: route.provider, model: route.model }
+      composition.fire(session, requestHeader(session.route?.provider ?? '', session.route?.model ?? ''))
+    },
     projection: (state) => { projection = state },
     ready: async () => {
       for (let attempt = 0; attempt < 200 && facility.domain === undefined; attempt += 1) {

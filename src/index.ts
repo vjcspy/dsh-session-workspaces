@@ -3,18 +3,27 @@
  * workspace, store it durably, and publish it with the plugin's group records
  * over two admission-fenced `/api` routes.
  *
- * The cadence is `session-title`'s own, deliberately: the same
- * `session/event` stream, the same `source.kind === 'user'` filter, and the same
- * "first eligible message" condition, read from a session projection so a
- * restart cannot restart the count. What differs is the work it drives — one
- * hidden auxiliary call with no `sessionId` and nothing appended to the
- * conversation surface — and the fact that failure is silent: a provider error,
- * a deadline or an unparseable answer records nothing and leaves the Session,
- * its turn and the core title feature exactly as they were.
+ * The cadence is `session-title`'s own predicate — the `source.kind === 'user'`
+ * filter and the "first eligible message" condition — but not its trigger. The
+ * work runs when the Session's **`request/header`** is committed, because that
+ * is the instant the Session's own route exists: `packages/core/agent-loop/src/agent.ts`
+ * appends the first `user/message` at `:421` and only then calls `buildRequest`
+ * at `:425`, which appends the header. Observing the prompt instead would find
+ * no route at all for a brand-new Session, and a plugin that resolved the route
+ * there — or that armed its work there and lost the arm to a storage handle
+ * that had not opened yet — recorded nothing for that Session forever.
  *
- * The route is never invented. Config `provider`/`model` wins; otherwise the
- * Session's own logged route answers, which is why the call waits for the
- * `request/header` the first turn produces; otherwise there is no call at all.
+ * So nothing is armed and nothing is waited for: the route, the prompt and the
+ * eligibility are all read at the one instant the route exists. A Session that
+ * never commits a `request/header` is a Session that never dispatched a
+ * request, and it records nothing — which is the contract's "no route → no call
+ * at all" branch, with no sleep and no timer between the two.
+ *
+ * What the call does is unchanged: one hidden auxiliary call with no
+ * `sessionId` and nothing appended to the conversation surface, and silent
+ * failure — a provider error, a deadline or an unparseable answer records
+ * nothing and leaves the Session, its turn and the core title feature exactly
+ * as they were.
  *
  * @module dsh-session-workspaces
  */
@@ -39,7 +48,7 @@ import { classify, resolveRoute, routeFromHeader, type SessionRoute } from './ho
 import { sessionWorkspacesDomain } from './host/domain.ts'
 import { registerFirstPromptProjection } from './host/projection.ts'
 import { registerFencedRoutes, routeDeps } from './host/routes.ts'
-import { humanPromptText, type LoggedEvent } from './host/session-log.ts'
+import type { LoggedEvent } from './host/session-log.ts'
 import { attachDomain, WorkspaceStore } from './host/store.ts'
 
 /** Cordis plugin name and bundle id. */
@@ -57,18 +66,8 @@ export const inject = ['storageDomain', 'llm', 'sessionProjections', 'sessionQue
 /** How often the stored-Session working directories are re-sampled. */
 const WORKING_DIRECTORY_TTL_MS = 300_000
 
-/** How long a Session waits for a `request/header` before it is dropped. */
-const ROUTE_WAIT_MS = 300_000
-
 /** The plugin entry schema (schemastery; see `schema.ts`). */
 export const Config = PluginConfigSchema
-
-/** One Session whose first prompt is known but whose route is not yet. */
-interface PendingEntry {
-  readonly session: Session
-  readonly prompt: string
-  readonly timer: ReturnType<typeof setTimeout>
-}
 
 /**
  * Mount the host half.
@@ -77,7 +76,13 @@ interface PendingEntry {
  */
 export function apply(ctx: Context, config: PluginConfig = {}): void {
   const resolver = new CandidateResolver()
-  const pending = new Map<string, PendingEntry>()
+  // Sessions whose first prompt has already been attempted and did NOT produce
+  // a decision. A Session commits several `request/header` events per turn
+  // (`initial`/`change`/`series`), so without this a provider failure would
+  // spend one model call per header, forever. A SUCCESSFUL decision is not
+  // remembered here: it is durable (`store.isDecided`), so this set holds only
+  // the failures and a restart clears them.
+  const settled = new Set<string>()
   let storedWorkingDirectories: string[] = []
   let disposed = false
   let store: WorkspaceStore | undefined
@@ -126,59 +131,51 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
   })
 
   ctx.on('session/event', (session, event) => {
-    if (event.type === 'request/header') {
-      // The route may have arrived after the first prompt: that is the moment
-      // the session-route branch can answer, and `attempt` decides.
-      void attempt(String(session.id))
-      return
-    }
-    if (event.type !== 'user/message') return
-    if (store === undefined) return
-    if (!settings().enabled) return
-    const sessionId = String(session.id)
-    if (pending.has(sessionId)) return
-    // A decision already exists, or a Human pinned it: never re-decide.
-    if (store.isDecided(sessionId)) return
-    // Subagent Sessions are children of the Session that spawned them; the
-    // first-count condition is the same one `session-title` uses.
-    if (session.header.parentSession !== undefined) return
-    const prompt = humanPromptText(event.data)
-    if (prompt === undefined) return
-    const state = ctx.sessionProjections.stateOf(session, FIRST_PROMPT_PROJECTION)
-    if (state === undefined || state.count !== 1) return
-    const entry: PendingEntry = {
-      session,
-      prompt,
-      timer: setTimeout(() => { pending.delete(sessionId) }, ROUTE_WAIT_MS),
-    }
-    entry.timer.unref?.()
-    pending.set(sessionId, entry)
-    void attempt(sessionId)
+    // The ONE trigger: the Session's own request header, which is where its
+    // route is. `attempt` re-reads the prompt and every eligibility condition
+    // from durable/derived state at this instant, so a Session whose first
+    // prompt was committed while this plugin could not act on it (its storage
+    // unit had not opened, or the feature was disabled) still classifies on the
+    // next header instead of being lost.
+    if (event.type !== 'request/header') return
+    void attempt(session)
   })
 
   /**
-   * Run the classification for one pending Session, if its route is known.
-   * @param sessionId - the pending Session.
+   * Classify one Session's first prompt, if its route and prompt are both known.
+   * @param session - the Session whose header was just committed.
    */
-  const attempt = async (sessionId: string): Promise<void> => {
-    const entry = pending.get(sessionId)
+  const attempt = async (session: Session): Promise<void> => {
     const current = store
-    if (entry === undefined || current === undefined) return
+    const sessionId = String(session.id)
+    if (current === undefined) return
+    if (settled.has(sessionId)) return
+    if (!settings().enabled) return
+    // A decision already exists, or a Human pinned it: never re-decide.
+    if (current.isDecided(sessionId)) return
+    // Subagent Sessions are children of the Session that spawned them; the
+    // first-count condition is the same one `session-title` uses.
+    if (session.header.parentSession !== undefined) return
+    // The prompt comes from this plugin's own projection, so it is the SAME
+    // fact a restart replays rather than an in-memory capture that a reload
+    // would lose.
+    const state = ctx.sessionProjections.stateOf(session, FIRST_PROMPT_PROJECTION)
+    if (state === undefined || state.count !== 1 || state.prompt === null) return
     const live = settings()
+    // Resolved HERE, where the route exists — never earlier and never guessed.
     const route = resolveRoute(
       { provider: live.provider, model: live.model },
-      routeOf(entry.session),
+      routeOf(session),
     )
-    // No route yet: the entry stays armed while the first turn produces its
-    // `request/header`. With no route ever, nothing is recorded.
+    // No route even now (an incomplete header, or a request that dispatched on
+    // nothing): record nothing and leave the Session on core grouping.
     if (route.source === 'none') return
-    pending.delete(sessionId)
-    clearTimeout(entry.timer)
+    settled.add(sessionId)
     try {
       const outcome = await classify({ stream: options => ctx.llm.stream(options) }, {
         provider: route.provider,
         model: route.model,
-        prompt: entry.prompt,
+        prompt: state.prompt,
         candidates: candidateLabels(),
         unknownLabel: live.unknownLabel,
         threshold: live.threshold,
@@ -188,6 +185,8 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
         return
       }
       const written = await current.recordLabel(sessionId, outcome.label, outcome.confidence)
+      // The decision is durable now, so the in-memory guard is no longer needed.
+      settled.delete(sessionId)
       ctx.logger.debug(
         `${PLUGIN_ID}: ${sessionId} → ${outcome.label} (${String(outcome.confidence)}) via ${route.source}${written ? '' : ' — pinned, not written'}`,
       )
@@ -254,8 +253,7 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
   ctx.effect(() => () => {
     disposed = true
     clearInterval(sampler)
-    for (const entry of pending.values()) clearTimeout(entry.timer)
-    pending.clear()
+    settled.clear()
     const closing = store
     store = undefined
     if (closing !== undefined) void closing.close()

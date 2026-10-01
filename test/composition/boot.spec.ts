@@ -7,11 +7,17 @@
  * appends nothing to the conversation surface, the route is resolved from Config
  * then the Session's own logged route and otherwise no call happens at all, and a
  * pinned Session is never re-decided.
+ *
+ * Every turn here is delivered in the host's own order — the prompt, then the
+ * `request/header` that carries the route — because the plugin acts on the
+ * header. `test/composition/route-ordering.spec.ts` drives the same ordering
+ * through a REAL `Session` and a real projection registry; this file drives it
+ * through the stubs, so the two disagreeing is itself a signal.
  */
 
 import { afterEach, describe, expect, it } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
-import { boot, humanMessage, requestHeader, type Composition } from './harness.ts'
+import { boot, requestHeader, type Composition } from './harness.ts'
 import { MAP_PATH } from '../../src/config.ts'
 
 /** Compositions booted by the current spec, torn down afterwards. */
@@ -33,6 +39,9 @@ function labelOf(composition: Composition, sessionId: string): string | undefine
   return composition.facility.domain?.labels.get(sessionId)?.workspace
 }
 
+/** The one route pair every stub turn runs on unless a test says otherwise. */
+const ROUTE = { provider: 'p', model: 'm' } as const
+
 describe('composition', () => {
   it('activates the built artifact and registers its three fenced routes', async () => {
     const composition = await bootTracked()
@@ -52,25 +61,28 @@ describe('the classification cadence', () => {
     const composition = await bootTracked()
     await composition.ready()
     const session = composition.session('s1')
-    session.route = { provider: 'session-p', model: 'session-m' }
-    composition.fire(session, humanMessage('please fix the tinybots order sync'))
+    composition.turn(session, 'please fix the tinybots order sync', { provider: 'session-p', model: 'session-m' })
     await composition.settle()
 
     expect(composition.llmCalls).toHaveLength(1)
+    expect(composition.llmCalls[0]?.provider).toBe('session-p')
     expect(labelOf(composition, 's1')).toBe('k')
   })
 
-  it('waits for the request header when the Session has no route yet, then classifies', async () => {
+  it('makes no call while only the prompt is committed, then classifies when its header arrives', async () => {
     const composition = await bootTracked()
     await composition.ready()
     const session = composition.session('s1')
-    composition.fire(session, humanMessage('work on the k repo'))
+    // The prompt alone: this is the instant at which a brand-new Session has NO
+    // logged route, so nothing may be called and nothing may be recorded.
+    composition.fire(session, { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'work on the k repo' }] }, seq: 8 })
     await composition.settle()
-    // No route yet: nothing was called and nothing was recorded.
     expect(composition.llmCalls).toHaveLength(0)
+    expect(labelOf(composition, 's1')).toBeUndefined()
 
-    session.route = { provider: 'p', model: 'm' }
-    composition.fire(session, requestHeader('p', 'm'))
+    // The header the same turn appends, carrying the route.
+    session.route = ROUTE
+    composition.fire(session, requestHeader(ROUTE.provider, ROUTE.model))
     await composition.settle()
     expect(composition.llmCalls).toHaveLength(1)
     expect(labelOf(composition, 's1')).toBe('k')
@@ -80,8 +92,7 @@ describe('the classification cadence', () => {
     const composition = await bootTracked()
     await composition.ready()
     const session = composition.session('s1')
-    composition.fire(session, humanMessage('no route anywhere'))
-    composition.fire(session, requestHeader('', ''))
+    composition.turn(session, 'no route anywhere')
     await composition.settle()
     expect(composition.llmCalls).toHaveLength(0)
     expect(labelOf(composition, 's1')).toBeUndefined()
@@ -91,8 +102,7 @@ describe('the classification cadence', () => {
     const composition = await bootTracked({ provider: 'cfg-p', model: 'cfg-m' })
     await composition.ready()
     const session = composition.session('s1')
-    session.route = { provider: 'session-p', model: 'session-m' }
-    composition.fire(session, humanMessage('anything'))
+    composition.turn(session, 'anything', { provider: 'session-p', model: 'session-m' })
     await composition.settle()
     expect(composition.llmCalls[0]?.provider).toBe('cfg-p')
   })
@@ -101,8 +111,7 @@ describe('the classification cadence', () => {
     const composition = await bootTracked()
     await composition.ready()
     const session = composition.session('s1')
-    session.route = { provider: 'p', model: 'm' }
-    composition.fire(session, humanMessage('work on the k repo'))
+    composition.turn(session, 'work on the k repo', ROUTE)
     await composition.settle()
 
     const call = composition.llmCalls[0]
@@ -115,10 +124,9 @@ describe('the classification cadence', () => {
   it('ignores a Session that is not on its first human message', async () => {
     const composition = await bootTracked()
     await composition.ready()
-    composition.projection({ count: 2, seq: 9 })
+    composition.projection({ count: 2, seq: 9, prompt: 'a first prompt' })
     const session = composition.session('s1')
-    session.route = { provider: 'p', model: 'm' }
-    composition.fire(session, humanMessage('a second prompt'))
+    composition.turn(session, 'a second prompt', ROUTE)
     await composition.settle()
     expect(composition.llmCalls).toHaveLength(0)
   })
@@ -126,12 +134,13 @@ describe('the classification cadence', () => {
   it('ignores a non-human message and a child Session', async () => {
     const composition = await bootTracked()
     await composition.ready()
+    composition.projection({ count: 1, seq: 1, prompt: null })
     const session = composition.session('s1')
-    session.route = { provider: 'p', model: 'm' }
     composition.fire(session, { type: 'user/message', data: { source: { kind: 'agent' }, content: [{ type: 'text', text: 'tool output' }] } })
+    composition.fire(session, requestHeader(ROUTE.provider, ROUTE.model))
+    composition.projection({ count: 1, seq: 1, prompt: 'from a subagent' })
     const child = composition.session('child', { parent: 's1' })
-    child.route = { provider: 'p', model: 'm' }
-    composition.fire(child, humanMessage('from a subagent'))
+    composition.turn(child, 'from a subagent', ROUTE)
     await composition.settle()
     expect(composition.llmCalls).toHaveLength(0)
   })
@@ -141,12 +150,25 @@ describe('the classification cadence', () => {
     await composition.ready()
     composition.scriptThrow('socket closed')
     const session = composition.session('s1')
-    session.route = { provider: 'p', model: 'm' }
-    composition.fire(session, humanMessage('work on the k repo'))
+    composition.turn(session, 'work on the k repo', ROUTE)
     await composition.settle()
     expect(composition.llmCalls).toHaveLength(1)
     expect(labelOf(composition, 's1')).toBeUndefined()
     expect(session.appended).toEqual([])
+  })
+
+  it('attempts a failing Session once, not once per header', async () => {
+    const composition = await bootTracked()
+    await composition.ready()
+    composition.scriptThrow('socket closed')
+    const session = composition.session('s1')
+    composition.turn(session, 'work on the k repo', ROUTE)
+    await composition.settle()
+    // A later turn commits more headers (change / series) for the same Session.
+    composition.fire(session, requestHeader(ROUTE.provider, ROUTE.model))
+    composition.fire(session, requestHeader(ROUTE.provider, ROUTE.model))
+    await composition.settle()
+    expect(composition.llmCalls).toHaveLength(1)
   })
 
   it('records nothing for an unparseable answer', async () => {
@@ -157,8 +179,7 @@ describe('the classification cadence', () => {
       { type: 'finish', reason: { kind: 'stop' } },
     ] as readonly StreamChunk[])
     const session = composition.session('s1')
-    session.route = { provider: 'p', model: 'm' }
-    composition.fire(session, humanMessage('work on the k repo'))
+    composition.turn(session, 'work on the k repo', ROUTE)
     await composition.settle()
     expect(labelOf(composition, 's1')).toBeUndefined()
   })
@@ -171,8 +192,7 @@ describe('the classification cadence', () => {
       { type: 'finish', reason: { kind: 'stop' } },
     ] as readonly StreamChunk[])
     const session = composition.session('s1')
-    session.route = { provider: 'p', model: 'm' }
-    composition.fire(session, humanMessage('work on the shopify repo'))
+    composition.turn(session, 'work on the shopify repo', ROUTE)
     await composition.settle()
     expect(labelOf(composition, 's1')).toBe('unknown workspace')
   })
@@ -181,13 +201,12 @@ describe('the classification cadence', () => {
     const composition = await bootTracked()
     await composition.ready()
     const session = composition.session('s1')
-    session.route = { provider: 'p', model: 'm' }
     // A Human assignment lands first, as the menu action does it.
     const route = composition.routes.find(candidate => candidate.path === MAP_PATH)
     expect(route).toBeDefined()
     const store = composition.facility.domain
     await store?.pins.put('s1', { workspace: 'tinybots', pinnedAt: '2026-10-01T00:00:00.000Z' })
-    composition.fire(session, humanMessage('work on the k repo'))
+    composition.turn(session, 'work on the k repo', ROUTE)
     await composition.settle()
     expect(composition.llmCalls).toHaveLength(0)
     expect(labelOf(composition, 's1')).toBeUndefined()
@@ -197,8 +216,7 @@ describe('the classification cadence', () => {
     const composition = await bootTracked()
     await composition.ready()
     const session = composition.session('s1')
-    session.route = { provider: 'p', model: 'm' }
-    composition.fire(session, humanMessage('work on the k repo'))
+    composition.turn(session, 'work on the k repo', ROUTE)
     await composition.settle()
     const route = composition.routes.find(candidate => candidate.path === MAP_PATH)
     const response = await route?.fetch(new Request(`http://127.0.0.1${MAP_PATH}`, { method: 'GET' }))
