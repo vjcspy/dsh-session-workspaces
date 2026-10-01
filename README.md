@@ -151,10 +151,21 @@ measured, `401` without the cookie, `200` from the page.
 | `GET /api/dsh-session-workspaces/map` | — | placements, groups, the candidate set, backfill progress |
 | `POST /api/dsh-session-workspaces/mutate` | `{sessionId, workspace, group?}` or `{op: 'group.create'\|'group.rename'\|'group.delete'\|'group.removeMember', …}` | the map as it stands after the write |
 | `POST /api/dsh-session-workspaces/backfill` | `{action: 'start'\|'status'}` | backfill progress and the map |
+| `GET /api/dsh-session-workspaces/catalog` | — | the advertised `provider`/`model` routes, the providers that could not be enumerated, and the sample instant |
 
 No extra CSRF layer is added: the browser session cookie is host-only, `HttpOnly`
 and `SameSite=Strict`, and `api-request-trust.ts` refuses a cross-site `Origin`
 before the body is read. The JSON content-type check is defense in depth.
+
+The catalog route is the one route that does **not** read the durable store, so it
+registers at apply time: the settings control has to be able to offer routes even
+when the storage unit failed to open. It never fails — a provider whose models
+cannot be enumerated is reported per provider and the rest of the catalog still
+answers, and a directory that cannot even be listed answers an **empty** catalog
+carrying the reason. A provider that advertises no models simply contributes no
+option and is not a failure. The host samples it through `ctx.llm.listProviders()`
+and `ctx.llm.listModels(provider)` and reuses one sample for 60 s, because a
+remote adapter's model list is a network round trip.
 
 Moving a Session into a group **owned by another workspace** moves the Session's
 workspace too, in the same write: the group record carries its workspace.
@@ -201,9 +212,33 @@ group's recorded order therefore always mirrors its natural order.
 
 ## Settings
 
-`settings.section` "Session workspaces": `enabled`, `provider`, `model`, the
-additional candidate list (with the discovered labels shown read-only), the
-unknown label, the minimum confidence, and the backfill action.
+`settings.section` "Session workspaces": `enabled`, ONE compact, single-line
+`<select>` for the classification route, the additional candidate list (with the
+discovered labels shown read-only), the unknown label, the minimum confidence, and
+the backfill action.
+
+The route control replaces the separate `provider` and `model` text fields and
+offers, in order:
+
+1. **Auto** — `Auto — use the Session's own route` — which writes EMPTY `provider`
+   and `model`. That is the default path, where every Session classifies through
+   its own logged route; making a value mandatory here would put that path out of
+   reach from the UI.
+2. one option per advertised route, labelled `provider/model` with the technical
+   tokens verbatim and no decoration;
+3. the route that is currently stored, when nothing advertises it, labelled
+   `… (unavailable)` — so a configured route stays visible, and stays savable,
+   while the catalog is missing or partial instead of the control silently
+   dropping it.
+
+A route is a **pair**, so the control carries ONE value for both fields
+(`JSON.stringify([provider, model])`; the empty string is Auto) and the two Config
+fields are read back out of the option list when the draft is written. A
+mismatched pair is therefore not representable, and a value the list does not
+carry writes nothing at all. The catalog itself comes from the Host's own fenced
+`…/catalog` route — this half takes no dependency on a core client service — and a
+read that fails or comes back empty leaves the control usable with the stored
+value intact.
 
 Every writable field is declared **`volatile`** in the Host `Config`, because a
 non-volatile field is refused by the settings write gate; a write commits into
@@ -239,7 +274,13 @@ deadline, provider error, and every route-resolution branch including "no route 
 no call"), the store (record layout, put-then-update, pin, group CRUD, lazy
 dangling references, handle lifetime, second-open rejection), the fenced routes
 (verbs, statuses, malformed writes, and that they are registered on the fenced
-channel and never on `webServer`), the provider's one-level / two-level /
+channel and never on `webServer`), the route control's option union (Auto first,
+then every advertised route, then a stored-but-unadvertised route as
+`(unavailable)`, with no duplicates — and the empty pair Auto writes, which is the
+default-path regression guard), the route catalog (a provider with no models, a
+provider that fails while the rest of the catalog still answers, a directory that
+cannot be listed at all, the cache window, and the browser state that keeps the
+last good routes when a read fails), the provider's one-level / two-level /
 unclassified paths, the map cache, the menu actions, and one real-composition boot
 test through a generated `cordis.yml` that loads the BUILT artifact.
 

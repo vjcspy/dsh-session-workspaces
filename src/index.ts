@@ -1,7 +1,8 @@
 /**
  * Host half: classify the first human prompt of a Session into an Aweave
  * workspace, store it durably, and publish it with the plugin's group records
- * over two admission-fenced `/api` routes.
+ * over admission-fenced `/api` routes — plus the advertised route catalog the
+ * settings control offers.
  *
  * The cadence is `session-title`'s own predicate — the `source.kind === 'user'`
  * filter and the "first eligible message" condition — but not its trigger. The
@@ -44,10 +45,11 @@ import { Config as PluginConfigSchema } from './schema.ts'
 import type { Config as PluginConfig } from './schema.ts'
 import { Backfill, type StoredSessionRecord } from './host/backfill.ts'
 import { CandidateResolver } from './host/candidates.ts'
+import { RouteCatalog } from './host/catalog.ts'
 import { classify, resolveRoute, routeFromHeader, type SessionRoute } from './host/classifier.ts'
 import { sessionWorkspacesDomain } from './host/domain.ts'
 import { registerFirstPromptProjection } from './host/projection.ts'
-import { registerFencedRoutes, routeDeps } from './host/routes.ts'
+import { registerCatalogRoute, registerFencedRoutes, routeDeps } from './host/routes.ts'
 import type { LoggedEvent } from './host/session-log.ts'
 import { attachDomain, WorkspaceStore } from './host/store.ts'
 
@@ -188,7 +190,7 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
       // The decision is durable now, so the in-memory guard is no longer needed.
       settled.delete(sessionId)
       ctx.logger.debug(
-        `${PLUGIN_ID}: ${sessionId} → ${outcome.label} (${String(outcome.confidence)}) via ${route.source}${written ? '' : ' — pinned, not written'}`,
+        `${PLUGIN_ID}: ${sessionId} → ${outcome.label} (${String(outcome.confidence)}) via ${route.source} ${route.provider}/${route.model}${written ? '' : ' — pinned, not written'}`,
       )
     } catch (error) {
       // The classification is an auxiliary nicety: it must never disturb the
@@ -209,6 +211,16 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
 
   const sampler = setInterval(() => { void refreshWorkingDirectories() }, WORKING_DIRECTORY_TTL_MS)
   sampler.unref?.()
+
+  // The advertised route catalog. It does NOT depend on the durable store, so it
+  // registers at apply time: the settings control must be able to offer routes
+  // even when the storage unit failed to open, and the route answers an empty
+  // catalog WITH its reason rather than failing.
+  const catalog = new RouteCatalog({
+    listProviders: () => ctx.llm.listProviders(),
+    listModels: async (provider) => await ctx.llm.listModels(provider),
+  })
+  registerCatalogRoute(ctx, catalog)
 
   // ONE handle for the unit, opened here and released on dispose. A second open
   // of the same name is `already-open`, so the handle's lifetime is the plugin

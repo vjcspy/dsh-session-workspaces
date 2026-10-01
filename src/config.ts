@@ -58,6 +58,9 @@ export const MUTATE_PATH = '/api/dsh-session-workspaces/mutate'
 /** Fenced control for the opt-in, Human-triggered backfill. */
 export const BACKFILL_PATH = '/api/dsh-session-workspaces/backfill'
 
+/** Fenced read: the advertised `provider`/`model` catalog the settings control offers. */
+export const CATALOG_PATH = '/api/dsh-session-workspaces/catalog'
+
 /** Label recorded when the model cannot decide, answers out of set, or answers below the threshold. */
 export const DEFAULT_UNKNOWN_LABEL = 'unknown workspace'
 
@@ -66,6 +69,18 @@ export const DEFAULT_CONFIDENCE = 0.5
 
 /** Deadline for one classification call. A call past it records nothing. */
 export const CLASSIFY_TIMEOUT_MS = 30_000
+
+/**
+ * How long one sampled route catalog is reused before the adapters are asked
+ * again.
+ *
+ * Sampling asks every registered provider for its models, which for a remote
+ * adapter is a network round trip, so without a window a settings panel that
+ * re-reads the catalog would turn into a burst of discovery calls. A whole-read
+ * failure is deliberately NOT cached: a directory that was momentarily
+ * unlistable is retried by the next read.
+ */
+export const CATALOG_TTL_MS = 60_000
 
 /**
  * Local-storage key holding the last map the browser read.

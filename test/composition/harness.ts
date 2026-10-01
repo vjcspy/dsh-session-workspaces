@@ -129,6 +129,9 @@ export async function boot(options: BootOptions = {}): Promise<Composition> {
       }
       return (async function* () { for (const chunk of scripted) yield chunk })()
     },
+    // The advertised route catalog the settings control reads.
+    listProviders: () => [{ id: 'fixture-p' }],
+    listModels: async (provider: string) => provider === 'fixture-p' ? [{ id: 'fixture-m' }] : [],
   })
   ctx.provide('sessionProjections', {
     register: () => () => {},

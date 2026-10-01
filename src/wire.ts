@@ -95,6 +95,42 @@ export interface BackfillStatus {
   readonly lastError?: string | undefined
 }
 
+/** One advertised route: a provider and one model that provider advertises. */
+export interface CatalogRoute {
+  /** Provider route key, verbatim as the adapter registers it. */
+  readonly provider: string
+  /** Model id, verbatim as the adapter advertises it. */
+  readonly model: string
+}
+
+/** One provider whose models could not be enumerated. */
+export interface CatalogFailure {
+  /** Provider route key that failed. */
+  readonly provider: string
+  /** Why it failed, for the settings control's hint. */
+  readonly message: string
+}
+
+/**
+ * One catalog read: every `provider`/`model` pair the LLM directory advertises.
+ *
+ * The settings control builds its options from this, so the payload describes its
+ * own incompleteness: `routes` may be empty or partial, `failed` names the
+ * providers that could not be enumerated, and `error` is set when the directory
+ * could not even be listed — and the browser keeps whatever route it already had
+ * in every one of those cases.
+ */
+export interface CatalogPayload {
+  /** Every advertised pair, in provider registration order, then adapter order. */
+  readonly routes: readonly CatalogRoute[]
+  /** Providers whose models could not be enumerated; the catalog is then partial. */
+  readonly failed: readonly CatalogFailure[]
+  /** Set when the whole read failed, so an empty `routes` has a reason. */
+  readonly error?: string | undefined
+  /** ISO instant the payload was sampled. */
+  readonly sampledAt: string
+}
+
 /** One map read: everything the browser half needs to group and to offer the menu. */
 export interface MapPayload {
   /** Effective placement per Session id. A Session absent here is unclassified. */

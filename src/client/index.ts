@@ -3,9 +3,10 @@
  * above the group, contribute the four Session-menu entries, and mount the
  * Settings section.
  *
- * The whole half is a POLL over two admission-fenced routes — there is no push
- * channel from a plugin's host half to the page — and one consequence of the
- * seam's design shapes it: the seam recomputes the tree when a provider is
+ * The whole half reads admission-fenced routes: the map by poll — there is no
+ * push channel from a plugin's host half to the page — and the advertised route
+ * catalog once per page load, for the settings control. One consequence of the
+ * seam's design shapes the poll: the seam recomputes the tree when a provider is
  * registered, not when a provider's own data changes. So a map that changed
  * re-registers the provider, which moves the seam's revision and repaints the
  * tree once. That is what makes a classification land without a refresh.
@@ -28,10 +29,11 @@ import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 
 import { GROUPING_PROVIDER_ID, LOCALE_NAMESPACE, SETTINGS_NAMESPACE } from '../config.ts'
 import {
-  backfill as backfillRequest, createGroup as createGroupRequest, mutate as mutateRequest,
+  backfill as backfillRequest, createGroup as createGroupRequest, mutate as mutateRequest, readCatalog,
 } from './api.ts'
 import { en } from './locales.ts'
 import { registerGroupingProvider, type GroupingSeam } from './provider.ts'
+import { RouteCatalogState, type RouteCatalogSnapshot } from './route-catalog.ts'
 import {
   MoveToGroupItem, MoveToWorkspaceItem, NewGroupItem, RemoveFromGroupItem, type SessionMenuInjected,
 } from './SessionMenuItems.tsx'
@@ -117,6 +119,7 @@ export function apply(ctx: ClientContext): void {
   const form = ctx.configForms.get<SettingsValues>(SETTINGS_NAMESPACE)
   let cachedForm: unknown
   let cachedMap: MapPayload | undefined
+  let cachedCatalog: RouteCatalogSnapshot | undefined
   let cachedView: SettingsView | undefined
   let lastError: string | undefined
   const subscribers = new Set<() => void>()
@@ -124,24 +127,34 @@ export function apply(ctx: ClientContext): void {
     cachedView = undefined
     for (const listener of [...subscribers]) listener()
   }
+  // The advertised route catalog: one read per page load, for the settings
+  // control's route options. A failed read keeps whatever was resolved before
+  // (`RouteCatalogState`), so the control never loses a route it has shown.
+  const routeCatalog = new RouteCatalogState(readCatalog)
+  const unsubscribeCatalog = routeCatalog.subscribe(notify)
+  void routeCatalog.refresh()
+
   const unsubscribeForm = form.subscribe(notify)
   const unsubscribeMap = polling.store.subscribe(notify)
   ctx.effect(() => () => {
     unsubscribeForm()
     unsubscribeMap()
+    unsubscribeCatalog()
     subscribers.clear()
   }, `${GROUPING_PROVIDER_ID}: settings mirror`)
 
   const read = (): SettingsView => {
     const snapshot = form.getSnapshot()
     const map = polling.store.payload()
+    const catalog = routeCatalog.snapshot()
     // `useSyncExternalStore` compares snapshots by identity on every render AND
     // after every subscription check, so an uncached projection would re-render
-    // forever. Both sources document a stable reference until the next change,
+    // forever. Every source documents a stable reference until the next change,
     // which is exactly the cache key here.
-    if (cachedView === undefined || snapshot !== cachedForm || map !== cachedMap) {
+    if (cachedView === undefined || snapshot !== cachedForm || map !== cachedMap || catalog !== cachedCatalog) {
       cachedForm = snapshot
       cachedMap = map
+      cachedCatalog = catalog
       const value = snapshot.value ?? {}
       cachedView = {
         served: snapshot.status === 'ready',
@@ -154,6 +167,8 @@ export function apply(ctx: ClientContext): void {
         unknownLabel: value.unknownLabel ?? 'unknown workspace',
         confidence: value.confidence ?? 0.5,
         discovered: map?.candidates ?? [],
+        catalog: catalog.routes,
+        catalogError: catalog.error,
         backfill: map?.backfill ?? EMPTY_BACKFILL,
         error: lastError,
       }

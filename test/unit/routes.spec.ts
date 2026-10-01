@@ -6,9 +6,12 @@
 
 import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import { BACKFILL_PATH, MAP_PATH, MUTATE_PATH } from '../../src/config.ts'
+import { BACKFILL_PATH, CATALOG_PATH, MAP_PATH, MUTATE_PATH } from '../../src/config.ts'
 import { Backfill } from '../../src/host/backfill.ts'
-import { mapRoute, mutateRoute, backfillRoute, registerFencedRoutes, routeDeps } from '../../src/host/routes.ts'
+import { RouteCatalog } from '../../src/host/catalog.ts'
+import {
+  backfillRoute, catalogRoute, mapRoute, mutateRoute, registerCatalogRoute, registerFencedRoutes, routeDeps,
+} from '../../src/host/routes.ts'
 import { WorkspaceStore } from '../../src/host/store.ts'
 import { FakeContext } from '../support/fake-ctx.ts'
 import { FakeDomain } from '../support/fake-domain.ts'
@@ -40,6 +43,15 @@ function makeDeps(): ReturnType<typeof routeDeps> & { readonly store: WorkspaceS
   }
 }
 
+/** A catalog over a fixed fixture directory, with a fixed sample instant. */
+function makeCatalog(): RouteCatalog {
+  return new RouteCatalog({
+    listProviders: () => [{ id: 'fixture-p' }],
+    listModels: async provider => provider === 'fixture-p' ? [{ id: 'fixture-m' }] : [],
+    iso: () => '2026-10-01T00:00:00.000Z',
+  })
+}
+
 /** POST one JSON body to a route. */
 async function post(path: string, body: unknown, contentType = 'application/json'): Promise<Response> {
   const deps = makeDeps()
@@ -58,10 +70,13 @@ async function body(response: Response): Promise<Record<string, unknown>> {
 }
 
 describe('registration', () => {
-  it('registers all three routes on the admission-fenced channel, and on nothing else', () => {
+  it('registers every route on the admission-fenced channel, and on nothing else', () => {
     const ctx = new FakeContext()
+    // The catalog route is store-independent and registers first, at apply time;
+    // the other three follow once the storage unit has opened.
+    registerCatalogRoute(ctx as unknown as Context, makeCatalog())
     registerFencedRoutes(ctx as unknown as Context, makeDeps())
-    expect(ctx.routes.map(route => route.path)).toEqual([MAP_PATH, MUTATE_PATH, BACKFILL_PATH])
+    expect(ctx.routes.map(route => route.path)).toEqual([CATALOG_PATH, MAP_PATH, MUTATE_PATH, BACKFILL_PATH])
     // Declaring both verbs is what lets the handler answer 405 rather than
     // letting the channel claim the path does not exist.
     for (const route of ctx.routes) expect(route.methods).toEqual(['GET', 'POST'])
@@ -70,8 +85,9 @@ describe('registration', () => {
 
   it('removes every route on unload', () => {
     const ctx = new FakeContext()
+    registerCatalogRoute(ctx as unknown as Context, makeCatalog())
     registerFencedRoutes(ctx as unknown as Context, makeDeps())
-    expect(ctx.routes).toHaveLength(3)
+    expect(ctx.routes).toHaveLength(4)
     ctx.disposeAll()
     expect(ctx.routes).toHaveLength(0)
   })
@@ -94,6 +110,25 @@ describe(`GET ${MAP_PATH}`, () => {
     const refused = await route.fetch(new Request(`http://127.0.0.1${MAP_PATH}`, { method: 'POST' }))
     expect(refused.status).toBe(405)
     expect(refused.headers.get('allow')).toBe('GET')
+  })
+})
+
+describe(`GET ${CATALOG_PATH}`, () => {
+  it('answers the advertised routes and refuses every other verb with 405 and Allow', async () => {
+    const route = catalogRoute(makeCatalog())
+    const response = await route.fetch(new Request(`http://127.0.0.1${CATALOG_PATH}`, { method: 'GET' }))
+    expect(response.status).toBe(200)
+    const payload = await body(response)
+    expect(payload['success']).toBe(true)
+    expect(payload['data']).toEqual({
+      routes: [{ provider: 'fixture-p', model: 'fixture-m' }],
+      failed: [],
+      sampledAt: '2026-10-01T00:00:00.000Z',
+    })
+
+    const wrongVerb = await route.fetch(new Request(`http://127.0.0.1${CATALOG_PATH}`, { method: 'POST' }))
+    expect(wrongVerb.status).toBe(405)
+    expect(wrongVerb.headers.get('allow')).toBe('GET')
   })
 })
 

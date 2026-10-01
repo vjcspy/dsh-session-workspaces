@@ -1,5 +1,6 @@
 /**
- * The three fenced routes on the shared `/api` channel.
+ * The fenced routes on the shared `/api` channel: the map, the write route, the
+ * backfill control, and the advertised route catalog the settings control reads.
  *
  * The channel — not this plugin — owns admission: `connection.admit` runs in the
  * `/api` prefix handler before any route lookup, so a foreign `Host` is refused
@@ -22,8 +23,9 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { ConnectionFetchRoute } from '@deepseek-ai/dsh-client-connection'
-import { BACKFILL_PATH, MAP_PATH, MUTATE_PATH } from '../config.ts'
+import { BACKFILL_PATH, CATALOG_PATH, MAP_PATH, MUTATE_PATH } from '../config.ts'
 import type { Backfill } from './backfill.ts'
+import type { RouteCatalog } from './catalog.ts'
 import type { WorkspaceStore } from './store.ts'
 import type { AssignmentRequest, GroupOperation, MapPayload, MutateRequest } from '../wire.ts'
 import { isGroupOperation } from '../wire.ts'
@@ -267,4 +269,42 @@ export function registerFencedRoutes(ctx: Context, deps: FencedRouteDeps): void 
       return () => { void dispose() }
     }, `dsh-session-workspaces: ${route.path}`)
   }
+}
+
+/**
+ * The catalog read: every `provider`/`model` pair the LLM directory advertises.
+ *
+ * This is the one route that does not read the durable store, so it is registered
+ * at apply time rather than behind the store's asynchronous open: the settings
+ * control has to be able to offer routes even when the storage unit failed to
+ * open, and the route answers an EMPTY catalog carrying the reason rather than
+ * failing, because a `500` would leave the control with nothing to render.
+ * @param catalog - the sampled catalog.
+ * @returns the route.
+ */
+export function catalogRoute(catalog: RouteCatalog): ConnectionFetchRoute {
+  return {
+    path: CATALOG_PATH,
+    methods: CHANNEL_METHODS,
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      if (request.method !== 'GET') {
+        return refuse(405, 'METHOD_NOT_ALLOWED', `${request.method} is not implemented on ${CATALOG_PATH}`, 'GET')
+      }
+      return ok(await catalog.read())
+    },
+  }
+}
+
+/**
+ * Register the store-independent catalog route.
+ * @param ctx - Host context owning the `connection` service.
+ * @param catalog - the sampled catalog.
+ */
+export function registerCatalogRoute(ctx: Context, catalog: RouteCatalog): void {
+  const route = catalogRoute(catalog)
+  ctx.effect(() => {
+    const dispose = ctx.connection.fetch.register(route)
+    return () => { void dispose() }
+  }, `dsh-session-workspaces: ${route.path}`)
 }

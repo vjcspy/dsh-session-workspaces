@@ -18,7 +18,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { boot, requestHeader, type Composition } from './harness.ts'
-import { MAP_PATH } from '../../src/config.ts'
+import { CATALOG_PATH, MAP_PATH } from '../../src/config.ts'
 
 /** Compositions booted by the current spec, torn down afterwards. */
 const live: Composition[] = []
@@ -43,11 +43,23 @@ function labelOf(composition: Composition, sessionId: string): string | undefine
 const ROUTE = { provider: 'p', model: 'm' } as const
 
 describe('composition', () => {
-  it('activates the built artifact and registers its three fenced routes', async () => {
+  it('activates the built artifact and registers its four fenced routes', async () => {
     const composition = await bootTracked()
     expect(composition.routes.map(route => route.path)).toContain(MAP_PATH)
-    expect(composition.routes).toHaveLength(3)
+    expect(composition.routes.map(route => route.path)).toContain(CATALOG_PATH)
+    expect(composition.routes).toHaveLength(4)
     await composition.ready()
+  })
+
+  it('answers the advertised route catalog over its own fenced route', async () => {
+    const composition = await bootTracked()
+    await composition.ready()
+    const route = composition.routes.find(candidate => candidate.path === CATALOG_PATH)
+    const response = await route?.fetch(new Request(`http://127.0.0.1${CATALOG_PATH}`, { method: 'GET' }))
+    const payload = await response?.json() as { data: { routes: unknown[]; failed: unknown[]; sampledAt: string } }
+    expect(payload.data.routes).toEqual([{ provider: 'fixture-p', model: 'fixture-m' }])
+    expect(payload.data.failed).toEqual([])
+    expect(typeof payload.data.sampledAt).toBe('string')
   })
 
   it('mounts nothing when the profile omits the row', async () => {

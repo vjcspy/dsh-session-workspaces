@@ -1,5 +1,5 @@
 /**
- * The browser half's client for the three fenced routes.
+ * The browser half's client for the plugin's fenced routes.
  *
  * Every call goes to the Host's own `/api/dsh-session-workspaces/…` paths. The
  * channel's admission — the browser cookie, and a `Host` the deployment trusts —
@@ -7,13 +7,18 @@
  * relies on the same-origin cookie the page already holds.
  *
  * Decoding is bounded: a body that does not carry the fields this half reads is
- * a failure, reported as one, never rendered half-built.
+ * a failure, reported as one, never rendered half-built. The catalog is the one
+ * exception, where a single unusable entry is DROPPED rather than discarding the
+ * whole list: an empty catalog would take the Human's configured route out of the
+ * control that configures it.
  *
  * @module dsh-session-workspaces/client/api
  */
 
-import { BACKFILL_PATH, MAP_PATH, MUTATE_PATH } from '../config.ts'
-import type { BackfillStatus, MapPayload, MutateRequest } from '../wire.ts'
+import { BACKFILL_PATH, CATALOG_PATH, MAP_PATH, MUTATE_PATH } from '../config.ts'
+import type {
+  BackfillStatus, CatalogFailure, CatalogPayload, CatalogRoute, MapPayload, MutateRequest,
+} from '../wire.ts'
 
 /** One read or write that did not produce a usable value. */
 export class TransportError extends Error {
@@ -86,6 +91,48 @@ function toMap(value: unknown): MapPayload {
  */
 export async function readMap(): Promise<MapPayload> {
   return toMap(await call(MAP_PATH, { method: 'GET' }))
+}
+
+/** The pair one catalog entry carries, or undefined when it is not a pair. */
+function routeOf(value: unknown): CatalogRoute | undefined {
+  const entry = value as Partial<CatalogRoute> | undefined
+  if (entry === undefined || typeof entry.provider !== 'string' || typeof entry.model !== 'string') return undefined
+  return { provider: entry.provider, model: entry.model }
+}
+
+/** The provider and message one failure entry carries, or undefined. */
+function failureOf(value: unknown): CatalogFailure | undefined {
+  const entry = value as Partial<CatalogFailure> | undefined
+  if (entry === undefined || typeof entry.provider !== 'string' || typeof entry.message !== 'string') return undefined
+  return { provider: entry.provider, message: entry.message }
+}
+
+/** Narrow one payload to a catalog, or fail. */
+function toCatalog(value: unknown): CatalogPayload {
+  const candidate = value as Partial<CatalogPayload> | undefined
+  if (candidate === undefined || !Array.isArray(candidate.routes) || !Array.isArray(candidate.failed)
+    || typeof candidate.sampledAt !== 'string') {
+    throw new TransportError('malformed', `${CATALOG_PATH} answered without a usable catalog`)
+  }
+  return {
+    // A malformed entry is dropped, not fatal: see this module's own note.
+    routes: candidate.routes.flatMap(entry => routeOf(entry) ?? []),
+    failed: candidate.failed.flatMap(entry => failureOf(entry) ?? []),
+    ...(typeof candidate.error === 'string' ? { error: candidate.error } : {}),
+    sampledAt: candidate.sampledAt,
+  }
+}
+
+/**
+ * Read the advertised route catalog.
+ *
+ * The answer can legitimately be empty or partial — the settings control keeps
+ * the route it already had in every one of those cases — and a failure here is
+ * reported as a failure rather than as an empty catalog.
+ * @returns the current catalog.
+ */
+export async function readCatalog(): Promise<CatalogPayload> {
+  return toCatalog(await call(CATALOG_PATH, { method: 'GET' }))
 }
 
 /**

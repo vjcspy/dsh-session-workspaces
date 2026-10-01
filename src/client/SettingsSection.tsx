@@ -1,6 +1,13 @@
 /**
- * The plugin's `settings.section`: the classification model, the candidate set,
+ * The plugin's `settings.section`: the classification route, the candidate set,
  * and the opt-in backfill.
+ *
+ * The route control is ONE compact, single-line `<select>` (see
+ * `./route-select.ts`): Auto, which writes empty `provider`/`model` and is the
+ * default path where a Session classifies through its own logged route; then every
+ * route the Host advertises; then the stored route when nothing advertises it. Its
+ * options come from the Host's fenced catalog route, so this half takes no
+ * dependency on a core client service.
  *
  * Reads ride the settings shell's shared describe mirror (`ctx.configForms`), so
  * every field here is a VOLATILE field of the host `Config` — a non-volatile
@@ -21,8 +28,9 @@ import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: the `settings.section` slot declaration and the `configForms` Context merge.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 
-import type { BackfillStatus } from '../wire.ts'
+import type { BackfillStatus, CatalogRoute } from '../wire.ts'
 import type { SessionWorkspacesTranslate } from './locales.ts'
+import { buildRouteOptions, decodeRoute, encodeRoute, routeFields } from './route-select.ts'
 
 /** One namespace view as this card renders it. */
 export interface SettingsView {
@@ -38,6 +46,10 @@ export interface SettingsView {
   readonly provider: string
   /** Configured route model, or empty. */
   readonly model: string
+  /** Routes the Host advertises right now; empty when none is, or when the read failed. */
+  readonly catalog: readonly CatalogRoute[]
+  /** Why the catalog read failed, while that stands. */
+  readonly catalogError: string | undefined
   /** Configured extra candidate labels, one per line. */
   readonly candidates: string
   /** Label recorded for an undecidable answer. */
@@ -84,14 +96,23 @@ const input: CSSProperties = {
   padding: '4px 6px',
 }
 const textarea: CSSProperties = { ...input, minHeight: 72, resize: 'vertical' }
+/** The route control: ONE compact, single-line select. */
+const select: CSSProperties = { ...input, maxWidth: 'fit-content', minWidth: 220 }
 const button: CSSProperties = { ...input, cursor: 'pointer', padding: '4px 10px', width: 'fit-content' }
 const danger: CSSProperties = { color: 'inherit', opacity: 0.9 }
 
-/** The editable draft, kept separate from the read view so typing does not fight the mirror. */
+/**
+ * The editable draft, kept separate from the read view so a selection does not
+ * fight the mirror.
+ *
+ * `route` is the route control's own VALUE — one encoded pair, or the empty string
+ * for Auto — rather than a provider and a model that could drift apart: a
+ * mismatched pair is not representable here, and the two Config fields are read
+ * back out of the option list when the draft is written.
+ */
 interface Draft {
   readonly enabled: boolean
-  readonly provider: string
-  readonly model: string
+  readonly route: string
   readonly candidates: string
   readonly unknownLabel: string
   readonly confidence: string
@@ -100,8 +121,7 @@ interface Draft {
 function draftOf(view: SettingsView): Draft {
   return {
     enabled: view.enabled,
-    provider: view.provider,
-    model: view.model,
+    route: encodeRoute(view.provider, view.model),
     candidates: view.candidates,
     unknownLabel: view.unknownLabel,
     confidence: String(view.confidence),
@@ -139,11 +159,26 @@ export function SessionWorkspacesSettings({
     }
   }
 
+  // The options are built from the route the VIEW reports as stored, not from the
+  // draft: a configured route that nothing advertises therefore stays in the list
+  // — and stays selectable — for as long as it is the stored one.
+  const options = buildRouteOptions({
+    advertised: view.catalog,
+    stored: { provider: view.provider, model: view.model },
+    autoLabel: t('settings.routeAuto'),
+    unavailableLabel: route => t('settings.routeUnavailable', { route }),
+  })
+  // The pair is read back out of the option list, so a write can only ever carry
+  // a whole option: Auto writes two EMPTY strings — the default path — and every
+  // other option writes exactly the pair it displays. `decodeRoute` is the
+  // unreachable fallback for a value this list did not carry, and it decodes to
+  // the same pair the option held.
+  const selected = routeFields(options, draft.route) ?? decodeRoute(draft.route)
   const confidence = Number.parseFloat(draft.confidence)
   const patch: Record<string, unknown> = {
     enabled: draft.enabled,
-    provider: draft.provider.trim(),
-    model: draft.model.trim(),
+    provider: selected.provider.trim(),
+    model: selected.model.trim(),
     candidates: draft.candidates.split('\n').map(line => line.trim()).filter(line => line !== ''),
     unknownLabel: draft.unknownLabel.trim() === '' ? undefined : draft.unknownLabel.trim(),
     confidence: Number.isFinite(confidence) ? confidence : undefined,
@@ -171,25 +206,33 @@ export function SessionWorkspacesSettings({
       </div>
 
       <div style={row}>
-        <span style={label}>{t('settings.provider')}</span>
-        <input
-          style={input}
-          aria-label={t('settings.provider')}
-          value={draft.provider}
-          onChange={(event) => { setDraft({ ...draft, provider: event.target.value }) }}
-        />
-        <span style={hint}>{t('settings.providerHint')}</span>
-      </div>
-
-      <div style={row}>
-        <span style={label}>{t('settings.model')}</span>
-        <input
-          style={input}
-          aria-label={t('settings.model')}
-          value={draft.model}
-          onChange={(event) => { setDraft({ ...draft, model: event.target.value }) }}
-        />
-        <span style={hint}>{t('settings.modelHint')}</span>
+        <label style={label} htmlFor="dsh-session-workspaces-route">{t('settings.route')}</label>
+        <select
+          id="dsh-session-workspaces-route"
+          style={select}
+          aria-label={t('settings.route')}
+          value={draft.route}
+          onChange={(event) => {
+            // A value this render's option list does not carry writes nothing, so
+            // the control can only ever produce a whole route or Auto.
+            const chosen = routeFields(options, event.target.value)
+            if (chosen === undefined) return
+            setDraft({ ...draft, route: encodeRoute(chosen.provider, chosen.model) })
+          }}
+        >
+          {options.map(option => (
+            <option key={option.kind === 'auto' ? 'auto' : option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+        <span style={hint}>{t('settings.routeHint')}</span>
+        {view.catalog.length === 0 && view.catalogError === undefined && (
+          <span style={hint}>{t('settings.routeCatalogEmpty')}</span>
+        )}
+        {view.catalogError !== undefined && (
+          <span style={hint}>{t('settings.routeCatalogFailed', { message: view.catalogError })}</span>
+        )}
       </div>
 
       <div style={row}>
