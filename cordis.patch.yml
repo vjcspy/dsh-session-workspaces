@@ -1,0 +1,48 @@
+# dsh-session-workspaces bundle patch: mounts the plugin on the host plane under
+# the stable id `dsh-session-workspaces` and its browser half on the web plane.
+#
+# The plugin provides three surfaces.
+#
+# 1. A classification pass over the session event stream. On the FIRST human
+#    `user/message` of a top-level Session (the cadence `session-title` uses —
+#    the same `source.kind === 'user'` filter and the same first-count
+#    condition) the plugin runs ONE `ctx.llm.stream` call. The call carries no
+#    `sessionId`, so `session-checkpoint-policy` does not wrap it in a durable
+#    checkpoint, and it appends nothing to the conversation surface, so it
+#    never becomes conversation context. The route is resolved explicitly:
+#    Config `provider`/`model`, else the Session's own logged route from its
+#    `request/header`, else NO call at all and nothing recorded.
+#
+# 2. Two admission-fenced routes on the shared `/api` channel, which is what
+#    fences them — the channel's `/api` prefix handler admits the browser
+#    cookie and a trusted Host before any route lookup, so registering through
+#    `ctx.connection.fetch` is the fence and a raw `webServer` route would have
+#    none:
+#
+#      GET  /api/dsh-session-workspaces/map      -> classification map + groups
+#      POST /api/dsh-session-workspaces/mutate   { sessionId, workspace, group? }
+#                                                | { op: 'group.create'|'group.rename'
+#                                                       |'group.delete'|'group.removeMember', … }
+#      POST /api/dsh-session-workspaces/backfill { action: 'start' } | { action: 'status' }
+#
+#    No extra CSRF layer is added: the browser session cookie is host-only,
+#    `HttpOnly` and `SameSite=Strict`, and `api-request-trust.ts` refuses a
+#    cross-site `Origin`/`sec-fetch-site` before the body is read. A JSON
+#    content-type check is applied as defense in depth only.
+#
+# 3. A `settings.section` choosing the classification model. Every writable
+#    field is declared `volatile` in this plugin's `Config`, because a
+#    non-volatile field is refused by the settings write gate; a write commits
+#    into the running reference and emits `loader/volatile-update` instead of
+#    remounting the plugin, and the plugin re-reads its live values on that
+#    event.
+#
+# Every value below is the default, so a deployment that names no `config` row
+# at all works unchanged. `candidates` is the configured ADDITION to the
+# directories this plugin discovers under the Aweave `workspaces/` root; it is
+# deliberately empty by default, and `workspacesRoot` is empty too, which means
+# "locate the root from each Session's own working directory".
+
+- insert:
+    - id: dsh-session-workspaces
+      name: 'dsh-session-workspaces'
