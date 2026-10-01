@@ -149,29 +149,27 @@ Two implementation notes that are load-bearing rather than stylistic:
   A reload renders before the first map read resolves, and without a
   synchronously available map the provider produces no rows on that render.
 
-### Known limitation (surfaced by Task 2, owned by the seam)
+### Reload persistence (seam-owned; fixed in `deepseek-harness` `45ac428677`)
 
-Even with both measures above, **a provider group's collapsed/expanded state does
-not survive a page reload on this seam**. Measured with a page init script that
-traces every write to the sidebar's view store:
+Earlier builds pruned a provider group's persisted collapsed state and manual order
+on the render that runs before this plugin's client bundle has registered its
+provider (~60 ms after DOMContentLoaded), so a provider group reloaded expanded and
+lost its saved Session order. **That is fixed in the seam**: since
+`deepseek-harness` `0003b94848` retention is ownership-scoped — it prunes only the
+keys the browser owns itself and leaves every key namespaced by a provider id
+(`<providerId>:…`) untouched, registered or not.
 
-```
-t=102ms  DOMContentLoaded, provider rows in the DOM: 0
-t=246ms  view-store write: provider keys ABSENT, rows 0   ← the prune
-t=307ms  view-store write: provider keys ABSENT, rows 3   ← the provider's rows exist now
-```
+Re-verified in a real browser against this plugin at `c939db4f` on
+`deepseek-harness` `45ac428677`: a collapsed provider workspace row and its collapsed
+nested group both reloaded collapsed (`aria-expanded="false"`), and the group's
+`sessionOrderByAccount` entry survived the reload.
 
-The sidebar retains its persisted view state against the keys of the CURRENT
-derivation on its first ready render. That render happens ~60 ms before this
-plugin's client bundle has registered its provider, so the provider's keys are
-pruned before they can be retained, and the store cannot be restored from outside
-(its in-memory state is the source of truth). A core Workspace key survives the
-same reload, and a provider key survives every collapse/expand *within* a page
-session — the loss is specific to the reload ordering.
-
-Fixing it needs a change in `deepseek-harness` — retain the keys of registered
-providers, or defer the first retention until every client bundle has applied —
-which is outside this plugin's scope.
+One gap in the same area remains, and it is core, not this plugin: a manual drag
+**inside** a provider group does not reorder its members. `WorkspaceBrowser`'s
+`commitSessionDrag` resolves the dragged account to `ungroupedSessionIds` or a
+Workspace `sessionIds` and returns early for any other account key, so the drag is
+discarded — the same synthetic drag reorders the flat list correctly, and a provider
+group's recorded order therefore always mirrors its natural order.
 
 ## Settings
 
