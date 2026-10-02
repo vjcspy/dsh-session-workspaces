@@ -27,7 +27,7 @@
  * as they were.
  *
  * The call answers TWICE from that one answer: it returns the sidebar label and
- * a summary of at most five words, and the plugin's own `sessionTitle` provider
+ * a summary of at most seven words, and the plugin's own `sessionTitle` provider
  * hands that summary to the core title service as the Conversation title. Both
  * readers go through ONE keyed decision (`./host/decision.ts`), so a Session
  * costs exactly one model call — which is the whole point of merging them.

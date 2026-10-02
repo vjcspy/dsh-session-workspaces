@@ -53,7 +53,7 @@ projection so a process restart cannot restart the count. Subagent Sessions are
 ignored.
 
 **That one call also returns the Conversation title.** Its answer carries a
-`summary` beside the label — at most **5 words**, or at most **10 characters**
+`summary` beside the label — at most **7 words**, or at most **14 characters**
 when the language does not separate words with spaces — and the plugin's own
 `sessionTitle` provider hands that summary to the core title service. Both
 readers await ONE keyed decision, keyed by Session id (`src/host/decision.ts`),
@@ -124,34 +124,34 @@ The plugin **owns the Conversation title now**, by registering its own
 The same call carries the title. The model-facing answer is exactly:
 
 ```json
-{"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 5 words>"}
+{"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 7 words>"}
 ```
 
 `summary` is normalized — invisible characters stripped, surrounding quotes
 stripped, internal whitespace collapsed — and then bounded by three rules
 (`normalizeSummary`, `src/host/classifier.ts`):
 
-1. **A summary written with word spaces is at most 5 words**
-   (`MAX_SUMMARY_WORDS`), truncated to its first five.
+1. **A summary written with word spaces is at most 7 words**
+   (`MAX_SUMMARY_WORDS`), truncated to its first seven.
 2. **A CJK summary — one that contains CJK characters and no whitespace at all —
-   is at most 10 characters** (`MAX_SUMMARY_CJK_CHARACTERS`). A whitespace-token
+   is at most 14 characters** (`MAX_SUMMARY_CJK_CHARACTERS`). A whitespace-token
    cap says nothing about a script that does not separate words with spaces: a
    Chinese sentence counts as ONE word, and without this budget the core would
    cut the accepted title itself, silently and mid-phrase, at `maxTitleBytes`.
-   10 is the core's own answer to the same case — the shipped sibling provider
-   aims for `targetCjkCharacters: 10`
+   14 keeps the core's own ratio for the same case — the shipped sibling
+   provider aims for `targetCjkCharacters: 10` beside `targetWords: 5`
    (`deepseek-harness` `packages/bundle/base/cordis.patch.yml:63-68`,
-   `packages/session/session-title-llm/src/index.ts:200`) — so a title derived
-   here is never longer than one the core would have derived for itself.
+   `packages/session/session-title-llm/src/index.ts:200`), two characters per
+   word — applied to this plugin's seven-word cap.
 3. **Every summary is at most 80 bytes** (`MAX_SUMMARY_BYTES`, mirroring the
    shipped `maxTitleBytes`), truncated on a **character** boundary so the partial
    word survives instead of being dropped. This is the backstop that makes the
    "the core never silently cuts our title" claim true for a long Latin word too:
-   five 40-character words are 200 bytes, and rule 1 alone would let the core do
-   the cutting.
+   seven 40-character words are 280 bytes, and rule 1 alone would let the core
+   do the cutting.
 
-The 10-character budget applies to CJK only, deliberately: a single long LATIN
-word is a word, and ten characters is not a shorter form of it, so such a word is
+The 14-character budget applies to CJK only, deliberately: a single long LATIN
+word is a word, and fourteen characters is not a shorter form of it, so such a word is
 bounded by rule 3 alone. Invisible-only content (`U+200B`, `U+FEFF`, `U+2060`,
 `U+00AD`, controls) is stripped **before** the quote strip, so a value wrapped in
 quotes across a zero-width character still has its quotes recognised, and a

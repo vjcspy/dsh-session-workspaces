@@ -44,7 +44,7 @@ export const MAX_PROMPT_CHARS = 8_000
  * enforced here: an over-long summary is truncated to its first
  * {@link MAX_SUMMARY_WORDS} words rather than discarded.
  */
-export const MAX_SUMMARY_WORDS = 5
+export const MAX_SUMMARY_WORDS = 7
 
 /**
  * Hard limit on the CHARACTERS of a CJK summary.
@@ -57,27 +57,28 @@ export const MAX_SUMMARY_WORDS = 5
  * (`packages/session/session-title/src/normalize.ts:39-61`), silently and
  * mid-phrase.
  *
- * 10 is the core's OWN answer to this exact case: the shipped sibling provider
- * aims for `targetCjkCharacters: 10`
+ * 14 keeps the core's OWN ratio for this exact case: the shipped sibling
+ * provider aims for `targetCjkCharacters: 10` beside `targetWords: 5`
  * (`packages/bundle/base/cordis.patch.yml:63-68`,
- * `packages/session/session-title-llm/src/index.ts:200`), so a title this plugin
- * derives is no longer than one the core would have derived for itself.
+ * `packages/session/session-title-llm/src/index.ts:200`) — two characters per
+ * word — and this plugin's word cap is seven (a Human decision, 2026-10-02), so
+ * its CJK budget is fourteen.
  *
- * It is a CHARACTER budget and therefore script-dependent: 10 UTF-16 code units
- * is at most 30 UTF-8 bytes for the CJK block, and a CJK ideograph outside the
- * BMP costs two code units and four bytes, so the worst case for ten code units
- * is two ideographs plus one BMP character = 10 bytes. Either way the budget sits
- * far below {@link MAX_SUMMARY_BYTES}, which is the point: the cap the model is
- * asked for is the binding one, and the byte cap is a backstop.
+ * It is a CHARACTER budget and therefore script-dependent: a BMP CJK character is
+ * one UTF-16 code unit and three UTF-8 bytes, and an ideograph outside the BMP is
+ * two code units and four bytes, so 14 code units are at most 42 UTF-8 bytes.
+ * Either way the budget sits below {@link MAX_SUMMARY_BYTES}, which is the point:
+ * the cap the model is asked for is the binding one, and the byte cap is a
+ * backstop.
  */
-export const MAX_SUMMARY_CJK_CHARACTERS = 10
+export const MAX_SUMMARY_CJK_CHARACTERS = 14
 
 /**
  * Whether a summary is written in a script that does not separate words.
  *
  * This is what decides which cap applies, and it is deliberately narrower than
  * "has no whitespace": a single long LATIN word is a word, not a CJK phrase, and
- * ten characters is not a shorter form of it. Such a word is bounded by
+ * fourteen characters is not a shorter form of it. Such a word is bounded by
  * {@link MAX_SUMMARY_BYTES} alone, which keeps the model's own word intact for as
  * long as the byte budget allows.
  *
@@ -185,14 +186,14 @@ export const CLASSIFIER_SYSTEM_PROMPT = [
   '  signal points somewhere outside the candidate list.',
   '- Report your confidence as a number between 0 and 1. Use a value below 0.5 when',
   '  you are guessing; a low-confidence answer is treated as the unknown label.',
-  '- Also summarise the message itself in `summary`: at most 5 words, a phrase',
+  '- Also summarise the message itself in `summary`: at most 7 words, a phrase',
   '  rather than a sentence, in the language the message is written in, naming what',
   '  the Human wants done. It becomes the conversation title. A language that does',
-  '  not separate words with spaces gets 10 characters instead of 5 words, so keep',
+  '  not separate words with spaces gets 14 characters instead of 7 words, so keep',
   '  it equally short there.',
   '',
   'Answer with a single JSON object and nothing else:',
-  '{"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 5 words>"}',
+  '{"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 7 words>"}',
 ].join('\n')
 
 /**
@@ -300,7 +301,7 @@ export function normalizeSummary(raw: unknown): string | undefined {
   // A whitespace-free CJK summary: the word cap says nothing about it, so it is
   // bounded by CHARACTERS instead — and only then, so a SPACED summary is
   // measured in words exactly as it was before, and so a single long Latin word
-  // is left to the byte budget rather than cut to ten characters.
+  // is left to the byte budget rather than cut to the CJK character budget.
   const first = candidates[0] ?? ''
   const capped = words.length === 1 && CJK.test(first)
     ? [first.slice(0, MAX_SUMMARY_CJK_CHARACTERS)]

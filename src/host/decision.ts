@@ -64,7 +64,7 @@ export type DecisionOutcome =
     readonly label: string
     /** Confidence the model reported, clamped to `[0, 1]`. */
     readonly confidence: number
-    /** The model's summary, at most five words. Never persisted. */
+    /** The model's summary, at most seven words. Never persisted. */
     readonly summary?: string | undefined
     /** The route the call actually ran on. */
     readonly route: ClassificationRoute

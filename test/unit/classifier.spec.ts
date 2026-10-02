@@ -225,11 +225,12 @@ describe('normalizeSummary', () => {
     expect(normalizeSummary('fix order sync')).toBe('fix order sync')
   })
 
-  it('truncates to the first five words', () => {
-    expect(normalizeSummary('fix the tinybots order sync bug now')).toBe('fix the tinybots order sync')
-    expect(normalizeSummary('fix the tinybots order sync bug now')?.split(' ')).toHaveLength(MAX_SUMMARY_WORDS)
-    expect(normalizeSummary('one two three four five six')).toBe('one two three four five')
-    expect(MAX_SUMMARY_WORDS).toBe(5)
+  it('truncates to the first seven words', () => {
+    expect(normalizeSummary('fix the tinybots order sync bug now please')).toBe('fix the tinybots order sync bug now')
+    expect(normalizeSummary('fix the tinybots order sync bug now please')?.split(' ')).toHaveLength(MAX_SUMMARY_WORDS)
+    expect(normalizeSummary('one two three four five six seven eight')).toBe('one two three four five six seven')
+    expect(normalizeSummary('one two three four five six seven')).toBe('one two three four five six seven')
+    expect(MAX_SUMMARY_WORDS).toBe(7)
   })
 
   it('drops the quotes a model wraps the value in', () => {
@@ -258,15 +259,15 @@ describe('normalizeSummary', () => {
     const normalized = normalizeSummary(cjk)
     expect(normalized).toBe(cjk.slice(0, MAX_SUMMARY_CJK_CHARACTERS))
     expect([...(normalized ?? '')]).toHaveLength(MAX_SUMMARY_CJK_CHARACTERS)
-    expect(MAX_SUMMARY_CJK_CHARACTERS).toBe(10)
-    // Ten CJK characters are 30 UTF-8 bytes: the character budget, not the byte
-    // backstop, is what bounds them.
-    expect(Buffer.byteLength(normalized ?? '', 'utf8')).toBe(30)
+    expect(MAX_SUMMARY_CJK_CHARACTERS).toBe(14)
+    // Fourteen CJK characters are 42 UTF-8 bytes: the character budget, not the
+    // byte backstop, is what bounds them.
+    expect(Buffer.byteLength(normalized ?? '', 'utf8')).toBe(42)
   })
 
   it('measures a single long NON-CJK word in BYTES, never in CJK characters', () => {
     // 28 characters is longer than MAX_SUMMARY_CJK_CHARACTERS, and cutting it to
-    // ten would be a wrong reading of "no whitespace": it is one word, and the
+    // fourteen would be a wrong reading of "no whitespace": it is one word, and the
     // byte budget keeps all of it.
     expect('Antidisestablishmentarianism').toHaveLength(28)
     expect(normalizeSummary('Antidisestablishmentarianism')).toBe('Antidisestablishmentarianism')
@@ -291,12 +292,12 @@ describe('normalizeSummary', () => {
   })
 
   it('truncates long Latin words on a letter boundary, inside the byte budget', () => {
-    // Five 40-character words is 200 ASCII bytes: without a byte backstop the
+    // Seven 40-character words is 280 ASCII bytes: without a byte backstop the
     // core would cut the accepted title at `maxTitleBytes` (80) itself, silently.
-    const text = ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40), 'd'.repeat(40), 'e'.repeat(40)].join(' ')
+    const text = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map(letter => letter.repeat(40)).join(' ')
     const normalized = normalizeSummary(text) ?? ''
     expect(Buffer.byteLength(normalized, 'utf8')).toBeLessThanOrEqual(80)
-    // Two words fit, not five: the byte budget binds long before the word cap.
+    // Two words fit, not seven: the byte budget binds long before the word cap.
     expect(normalized.split(' ').length).toBeLessThanOrEqual(MAX_SUMMARY_WORDS)
     // The partial word is kept rather than dropped, so the phrase survives as far
     // as the budget allows: 40 + 1 + 39 = 80.
@@ -338,8 +339,8 @@ describe('parseClassification with a summary', () => {
   })
 
   it('truncates an over-long summary without touching the label', () => {
-    expect(parseClassification('{"label":"k","confidence":0.9,"summary":"fix the tinybots order sync bug now"}', input))
-      .toEqual({ label: 'k', confidence: 0.9, summary: 'fix the tinybots order sync' })
+    expect(parseClassification('{"label":"k","confidence":0.9,"summary":"fix the tinybots order sync bug now please"}', input))
+      .toEqual({ label: 'k', confidence: 0.9, summary: 'fix the tinybots order sync bug now' })
   })
 
   it('normalizes a quoted and padded summary', () => {
@@ -377,7 +378,7 @@ describe('parseClassification with a summary', () => {
 describe('classify with a summary', () => {
   it('asks for the summary in the model-facing JSON shape', () => {
     expect(CLASSIFIER_SYSTEM_PROMPT).toContain(
-      '{"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 5 words>"}',
+      '{"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 7 words>"}',
     )
   })
 
