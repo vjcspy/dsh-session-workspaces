@@ -13,8 +13,13 @@ import {
   backfillRoute, catalogRoute, mapRoute, mutateRoute, registerCatalogRoute, registerFencedRoutes, routeDeps,
 } from '../../src/host/routes.ts'
 import { WorkspaceStore } from '../../src/host/store.ts'
+import type { TitleProviderStatus } from '../../src/host/title-provider.ts'
 import { FakeContext } from '../support/fake-ctx.ts'
 import { FakeDomain } from '../support/fake-domain.ts'
+
+/** A store, a backfill and the route deps over the in-memory double. */
+/** The title status every route case reports, so a case can vary it. */
+let titleProvider: TitleProviderStatus = 'ok'
 
 /** A store, a backfill and the route deps over the in-memory double. */
 function makeDeps(): ReturnType<typeof routeDeps> & { readonly store: WorkspaceStore } {
@@ -38,6 +43,7 @@ function makeDeps(): ReturnType<typeof routeDeps> & { readonly store: WorkspaceS
       backfill,
       candidates: () => ['k', 'tinybots'],
       unknownLabel: () => 'unknown workspace',
+      titleProvider: () => titleProvider,
     }),
     store,
   }
@@ -94,6 +100,23 @@ describe('registration', () => {
 })
 
 describe(`GET ${MAP_PATH}`, () => {
+  it('reports whether the plugin owns the Conversation title, read per request', async () => {
+    const deps = makeDeps()
+    const route = mapRoute(deps)
+    const read = async (): Promise<unknown> => {
+      const payload = await body(await route.fetch(new Request(`http://127.0.0.1${MAP_PATH}`, { method: 'GET' })))
+      return (payload['data'] as Record<string, unknown>)['titleProvider']
+    }
+    // The SAME registered route answers both ways: the status is read on each
+    // request rather than captured at registration, because the plugin's own
+    // registration attempt resolves asynchronously.
+    titleProvider = 'ok'
+    expect(await read()).toBe('ok')
+    titleProvider = 'unavailable'
+    expect(await read()).toBe('unavailable')
+    titleProvider = 'ok'
+  })
+
   it('answers the map and refuses every other verb with 405 and Allow', async () => {
     const deps = makeDeps()
     const route = mapRoute(deps)
@@ -106,6 +129,9 @@ describe(`GET ${MAP_PATH}`, () => {
     expect(data['groups']).toEqual([])
     expect(data['sessions']).toEqual({})
     expect(data['backfill']).toMatchObject({ running: false, pending: 0 })
+    // Additive field on the existing map response, so a profile whose title row
+    // is still enabled is observable without a log line.
+    expect(data['titleProvider']).toBe('ok')
 
     const refused = await route.fetch(new Request(`http://127.0.0.1${MAP_PATH}`, { method: 'POST' }))
     expect(refused.status).toBe(405)

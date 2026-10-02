@@ -13,7 +13,9 @@ import { describe, expect, it } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type Session } from '@deepseek-ai/dsh-session'
 import { DecisionLedger, type DecisionSettings } from '../../src/host/decision.ts'
-import { createTitleProvider, TITLE_PROVIDER_ID } from '../../src/host/title-provider.ts'
+import {
+  createTitleProvider, registerTitleProvider, TITLE_PROVIDER_ID, type TitleProviderStatus,
+} from '../../src/host/title-provider.ts'
 import type { WorkspaceStore } from '../../src/host/store.ts'
 
 /** A Session carrier: only the facts the ledger reads are present. */
@@ -154,6 +156,82 @@ describe('the title provider result', () => {
       messages: [{ seq: SessionSeq(1), text: 'x' }],
       signal: new AbortController().signal,
     })).rejects.toThrow(/no title summary \(provider-error\)/u)
+  })
+})
+
+/**
+ * The registration guard, driven against a scripted `sessionTitle` service.
+ *
+ * The service validates a candidate BEFORE it looks for a duplicate
+ * (`session-title/src/index.ts:471-477`), so this stub refuses on both grounds
+ * and the guard has to tell them apart from the message alone.
+ */
+function guard(options: { readonly refusal?: string; readonly held?: boolean } = {}): {
+  readonly warnings: string[]
+  readonly status: () => string
+} {
+  const warnings: string[] = []
+  const held = options.held ?? false
+  const ctx = {
+    inject: (_names: readonly string[], run: (scoped: unknown) => void) => {
+      run({
+        logger: { warn: (message: string) => { warnings.push(message) } },
+        sessionTitle: {
+          register: () => {
+            if (options.refusal !== undefined) throw new Error(options.refusal)
+            if (held) {
+              throw new Error('session-title provider "session-title-llm" is already registered')
+            }
+            return async () => {}
+          },
+        },
+      })
+    },
+  }
+  let status: TitleProviderStatus = 'unavailable'
+  registerTitleProvider(ctx as never, {} as never, (next) => { status = next })
+  return { warnings, status: () => status }
+}
+
+describe('the title provider registration guard', () => {
+  it('names the profile precondition for the singleton duplicate, and nothing else', () => {
+    const { warnings, status } = guard({ held: true })
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('is already registered')
+    expect(warnings[0]).toContain('HARD PRECONDITION')
+    expect(warnings[0]).toContain('session-title-llm')
+    expect(status()).toBe('unavailable')
+  })
+
+  it('reports any other refusal as itself, with no precondition', () => {
+    for (const refusal of [
+      'session-title provider automatic mode is invalid',
+      'session-title provider "someone-else" requires generate()',
+      'session-title service disposed',
+    ]) {
+      const { warnings, status } = guard({ refusal })
+      expect(warnings, refusal).toHaveLength(1)
+      expect(warnings[0], refusal).toContain(refusal)
+      expect(warnings[0], refusal).not.toContain('HARD PRECONDITION')
+      expect(warnings[0], refusal).not.toContain('session-title-llm')
+      expect(status(), refusal).toBe('unavailable')
+    }
+  })
+
+  it('reports the title as owned ONLY once the registration was accepted', () => {
+    const { warnings, status } = guard()
+    expect(warnings).toEqual([])
+    expect(status()).toBe('ok')
+  })
+
+  it('stays pessimistic when the service refuses the registration', () => {
+    // The status is the OUTCOME of the register call, never an optimistic guess.
+    // An earlier design probed the slot with a throwaway provider first, and that
+    // probe's disposer did not free the slot in the same turn — so the plugin's
+    // own registration was refused by its own probe and the map route reported
+    // `unavailable` while the plugin actually owned the title.
+    expect(guard({ held: true }).status()).toBe('unavailable')
+    expect(guard({ refusal: 'session-title service disposed' }).status()).toBe('unavailable')
   })
 })
 

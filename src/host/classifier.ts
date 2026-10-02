@@ -46,6 +46,73 @@ export const MAX_PROMPT_CHARS = 8_000
  */
 export const MAX_SUMMARY_WORDS = 5
 
+/**
+ * Hard limit on the CHARACTERS of a CJK summary.
+ *
+ * {@link MAX_SUMMARY_WORDS} is a whitespace-token cap, so a script that does not
+ * separate words with spaces — a Chinese or Japanese sentence, a Korean one
+ * written without spaces — counts as ONE word and would otherwise be bounded by
+ * nothing this plugin enforces. The gap is real rather than theoretical: the core
+ * then cuts the accepted title itself at `maxTitleBytes`
+ * (`packages/session/session-title/src/normalize.ts:39-61`), silently and
+ * mid-phrase.
+ *
+ * 10 is the core's OWN answer to this exact case: the shipped sibling provider
+ * aims for `targetCjkCharacters: 10`
+ * (`packages/bundle/base/cordis.patch.yml:63-68`,
+ * `packages/session/session-title-llm/src/index.ts:200`), so a title this plugin
+ * derives is no longer than one the core would have derived for itself.
+ *
+ * It is a CHARACTER budget and therefore script-dependent: 10 UTF-16 code units
+ * is at most 30 UTF-8 bytes for the CJK block, and a CJK ideograph outside the
+ * BMP costs two code units and four bytes, so the worst case for ten code units
+ * is two ideographs plus one BMP character = 10 bytes. Either way the budget sits
+ * far below {@link MAX_SUMMARY_BYTES}, which is the point: the cap the model is
+ * asked for is the binding one, and the byte cap is a backstop.
+ */
+export const MAX_SUMMARY_CJK_CHARACTERS = 10
+
+/**
+ * Whether a summary is written in a script that does not separate words.
+ *
+ * This is what decides which cap applies, and it is deliberately narrower than
+ * "has no whitespace": a single long LATIN word is a word, not a CJK phrase, and
+ * ten characters is not a shorter form of it. Such a word is bounded by
+ * {@link MAX_SUMMARY_BYTES} alone, which keeps the model's own word intact for as
+ * long as the byte budget allows.
+ *
+ * The ranges are the standard CJK blocks: kana, the CJK ideograph blocks
+ * (`\u4E00-\u9FFF` plus extensions A and B and the compatibility block), the
+ * CJK punctuation subrange that includes the ideographic full stop, and the
+ * Hangul syllables.
+ */
+const CJK = /[\u3000-\u303F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\u{20000}-\u{2FA1F}]/u
+
+/**
+ * Hard byte limit on the summary this plugin hands the core title service.
+ *
+ * Mirrors the `maxTitleBytes` the shipped `session-title` row is configured with
+ * (`packages/bundle/base/cordis.patch.yml:58-61`), which is the value that would
+ * otherwise do the cutting. Normalization truncates to it on a LETTER boundary,
+ * so the plugin never hands the core a title the core silently shortens — a
+ * deployment that LOWERS `maxTitleBytes` still gets a mid-title cut from the
+ * core, because the plugin cannot read that field (`SessionTitleService` exposes
+ * no config getter) and this constant is the one documented coupling.
+ */
+const MAX_SUMMARY_BYTES = 80
+
+/** Characters that occupy no width: a title of only these renders as nothing. */
+const INVISIBLE = /[\u00AD\u180E\u200B-\u200F\u2060-\u2064\u2066-\u206F\uFEFF]/gu
+
+/**
+ * Non-whitespace C0/C1 controls, plus DEL — the core's own non-whitespace control
+ * set (`packages/session/session-title/src/normalize.ts:10`) before its OSC/CSI/ESC
+ * passes have run. Stripped here too, so this plugin measures its byte budget on
+ * what the core will actually keep. Whitespace controls (`\t\n\v\f\r`) are
+ * deliberately NOT matched: they separate words, and they are collapsed later.
+ */
+const CONTROL = /[\u0000-\u0008\u000E-\u001F\u007F-\u009F]/gu
+
 /** Where a resolved route came from. `none` means: do not call. */
 export type RouteSource = 'config' | 'session' | 'none'
 
@@ -120,7 +187,9 @@ export const CLASSIFIER_SYSTEM_PROMPT = [
   '  you are guessing; a low-confidence answer is treated as the unknown label.',
   '- Also summarise the message itself in `summary`: at most 5 words, a phrase',
   '  rather than a sentence, in the language the message is written in, naming what',
-  '  the Human wants done. It becomes the conversation title.',
+  '  the Human wants done. It becomes the conversation title. A language that does',
+  '  not separate words with spaces gets 10 characters instead of 5 words, so keep',
+  '  it equally short there.',
   '',
   'Answer with a single JSON object and nothing else:',
   '{"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 5 words>"}',
@@ -225,9 +294,85 @@ const SUMMARY_QUOTES = new Set(['"', "'", '`', '\u201c', '\u201d', '\u2018', '\u
  */
 export function normalizeSummary(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined
-  const words = stripQuotes(raw).split(/\s+/u).filter(word => word !== '')
+  const words = stripQuotes(withoutInvisible(raw)).split(/\s+/u).filter(word => word !== '')
   if (words.length === 0) return undefined
-  return words.slice(0, MAX_SUMMARY_WORDS).join(' ')
+  const candidates = words.slice(0, MAX_SUMMARY_WORDS)
+  // A whitespace-free CJK summary: the word cap says nothing about it, so it is
+  // bounded by CHARACTERS instead — and only then, so a SPACED summary is
+  // measured in words exactly as it was before, and so a single long Latin word
+  // is left to the byte budget rather than cut to ten characters.
+  const first = candidates[0] ?? ''
+  const capped = words.length === 1 && CJK.test(first)
+    ? [first.slice(0, MAX_SUMMARY_CJK_CHARACTERS)]
+    : candidates
+  const bounded = truncateToBytes(capped.join(' '), MAX_SUMMARY_BYTES)
+  // Non-empty by construction: `capped` holds at least one token made only of
+  // visible, non-whitespace characters, and one such character is at most 4
+  // bytes — well inside the budget. The guard is the CONTRACT ("this plugin
+  // never hands the core a title the core reduces to empty, and never one the
+  // core silently cuts") stated where it is enforced, not a branch expected to
+  // be taken.
+  return bounded === '' ? undefined : bounded
+}
+
+/**
+ * Drop every character that occupies no width.
+ *
+ * Runs BEFORE the quote strip, so a value a model wrapped in quotes across an
+ * invisible character (`"<ZWSP>fix it<ZWSP>"`) still has its quotes recognised.
+ *
+ * The core runs the same two passes inside its own `cleanTitleText`
+ * (`packages/session/session-title/src/normalize.ts:22-31`), so stripping them
+ * here cannot change what the core renders — it makes this plugin's own caps
+ * count the characters the core will actually keep, and it turns "normalizes to
+ * nothing" into this plugin's decision to report NO summary rather than into a
+ * title the core throws away as empty.
+ * @param text - the raw field value.
+ * @returns the value with controls and zero-width characters removed.
+ */
+function withoutInvisible(text: string): string {
+  return text.replace(CONTROL, '').replace(INVISIBLE, '')
+}
+
+/**
+ * How many UTF-8 bytes one code point occupies.
+ *
+ * Written out rather than delegated to `Buffer.byteLength` for one concrete
+ * reason: `Buffer` needs the Node types, and the client tsconfig loads no types
+ * (`tsconfig.client.json`) while `src/config.ts` shares this module's directory.
+ * The threshold structure is the standard UTF-8 encoding, so the answer is exact.
+ * @param codePoint - the code point to measure.
+ * @returns its UTF-8 byte length, 1 through 4.
+ */
+function utf8ByteLength(codePoint: number): number {
+  if (codePoint <= 0x7F) return 1
+  if (codePoint <= 0x7FF) return 2
+  if (codePoint <= 0xFFFF) return 3
+  return 4
+}
+
+/**
+ * Truncate to a UTF-8 byte budget without splitting a character or a surrogate pair.
+ *
+ * A LETTER boundary, not a word boundary: the core's own cut is per character, so
+ * keeping the partial word keeps strictly more of the model's phrase inside the
+ * same budget.
+ * @param input - the joined, word-capped summary.
+ * @param maxBytes - positive UTF-8 byte budget.
+ * @returns the longest leading prefix within the budget, without trailing space.
+ */
+function truncateToBytes(input: string, maxBytes: number): string {
+  let used = 0
+  let output = ''
+  for (const character of input) {
+    const codePoint = character.codePointAt(0)
+    if (codePoint === undefined) continue
+    const bytes = utf8ByteLength(codePoint)
+    if (used + bytes > maxBytes) break
+    output += character
+    used += bytes
+  }
+  return used === 0 ? '' : output.trimEnd()
 }
 
 /**

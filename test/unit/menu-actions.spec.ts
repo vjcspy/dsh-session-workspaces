@@ -39,6 +39,7 @@ function harness(): {
     backfill,
     candidates: () => ['k', 'tinybots'],
     unknownLabel: () => 'unknown workspace',
+    titleProvider: () => 'ok',
   })
   const route = mutateRoute(deps)
   const send = async (body: MutateRequest): Promise<MapPayload> => {

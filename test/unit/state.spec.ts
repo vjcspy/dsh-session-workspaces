@@ -22,6 +22,7 @@ function map(revision: string): MapPayload {
     candidates: ['k'],
     unknownLabel: 'unknown workspace',
     backfill: { running: false, total: 0, pending: 0, done: 0, classified: 0, failed: 0, skipped: 0 },
+    titleProvider: 'ok',
   }
 }
 

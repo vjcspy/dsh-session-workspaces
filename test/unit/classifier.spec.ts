@@ -8,10 +8,12 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { normalizeSessionTitle } from '@deepseek-ai/dsh-session-title'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
   classify, normalizeSummary, parseClassification, resolveRoute, routeFromHeader,
-  CLASSIFIER_SYSTEM_PROMPT, buildUserMessage, MAX_PROMPT_CHARS, MAX_SUMMARY_WORDS,
+  CLASSIFIER_SYSTEM_PROMPT, buildUserMessage, MAX_PROMPT_CHARS,
+  MAX_SUMMARY_CJK_CHARACTERS, MAX_SUMMARY_WORDS,
 } from '../../src/host/classifier.ts'
 
 /** The candidate set every case validates against. */
@@ -245,6 +247,84 @@ describe('normalizeSummary', () => {
   it('answers "no summary" for a value that is not a usable string', () => {
     for (const raw of [undefined, null, 42, true, {}, [], '', '   ', '\t\n']) {
       expect(normalizeSummary(raw), String(raw)).toBeUndefined()
+    }
+  })
+
+  it('bounds a whitespace-free summary in characters, not in "one word"', () => {
+    // Chinese has no word spaces, so the word cap sees ONE token and would let an
+    // arbitrarily long summary through to the core's byte cut.
+    const cjk = '列出目录中的所有文件并告诉我它们的修改时间'
+    expect(cjk.split(/\s+/u)).toHaveLength(1)
+    const normalized = normalizeSummary(cjk)
+    expect(normalized).toBe(cjk.slice(0, MAX_SUMMARY_CJK_CHARACTERS))
+    expect([...(normalized ?? '')]).toHaveLength(MAX_SUMMARY_CJK_CHARACTERS)
+    expect(MAX_SUMMARY_CJK_CHARACTERS).toBe(10)
+    // Ten CJK characters are 30 UTF-8 bytes: the character budget, not the byte
+    // backstop, is what bounds them.
+    expect(Buffer.byteLength(normalized ?? '', 'utf8')).toBe(30)
+  })
+
+  it('measures a single long NON-CJK word in BYTES, never in CJK characters', () => {
+    // 28 characters is longer than MAX_SUMMARY_CJK_CHARACTERS, and cutting it to
+    // ten would be a wrong reading of "no whitespace": it is one word, and the
+    // byte budget keeps all of it.
+    expect('Antidisestablishmentarianism').toHaveLength(28)
+    expect(normalizeSummary('Antidisestablishmentarianism')).toBe('Antidisestablishmentarianism')
+    expect(normalizeSummary('Ünterstützung')).toBe('Ünterstützung')
+  })
+
+  it('answers "no summary" for a value made only of zero-width characters', () => {
+    // Each of these renders as nothing on its own, and the core strips all of
+    // them (`session-title/src/normalize.ts:10-12`), so a title built from them
+    // would reach the core as an empty title and be thrown away as one.
+    for (const raw of ['\u200B', '\u200B\u200C\u200D', '\uFEFF', '\u2060', '\u00AD', '\u180E', '\u200B \u200B', '"\u200B"']) {
+      expect(normalizeSummary(raw), JSON.stringify(raw)).toBeUndefined()
+    }
+  })
+
+  it('strips the invisible characters instead of counting them as content', () => {
+    // The quotes are recognised on the OTHER side of an invisible character,
+    // which is why the strip runs before the quote strip.
+    expect(normalizeSummary('"\u200Bfix it\u200B"')).toBe('fix it')
+    expect(normalizeSummary('fix\u200Bit')).toBe('fixit')
+    expect(normalizeSummary('fix\u0000it')).toBe('fixit')
+  })
+
+  it('truncates long Latin words on a letter boundary, inside the byte budget', () => {
+    // Five 40-character words is 200 ASCII bytes: without a byte backstop the
+    // core would cut the accepted title at `maxTitleBytes` (80) itself, silently.
+    const text = ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40), 'd'.repeat(40), 'e'.repeat(40)].join(' ')
+    const normalized = normalizeSummary(text) ?? ''
+    expect(Buffer.byteLength(normalized, 'utf8')).toBeLessThanOrEqual(80)
+    // Two words fit, not five: the byte budget binds long before the word cap.
+    expect(normalized.split(' ').length).toBeLessThanOrEqual(MAX_SUMMARY_WORDS)
+    // The partial word is kept rather than dropped, so the phrase survives as far
+    // as the budget allows: 40 + 1 + 39 = 80.
+    expect(normalized).toBe(`${'a'.repeat(40)} ${'b'.repeat(39)}`)
+  })
+
+  it('keeps every normalized summary inside the core title budget, whatever the script', () => {
+    const cases: readonly unknown[] = [
+      'fix order sync',
+      '列出目录中的所有文件并告诉我它们的修改时间',
+      'こんにちは世界これはテストです',
+      'a'.repeat(400),
+      '\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}',
+      '\u{20000}\u{20001}\u{20002}\u{20003}\u{20004}',
+      ['a'.repeat(60), 'b'.repeat(60), 'c'.repeat(60), 'd'.repeat(60), 'e'.repeat(60)].join(' '),
+      '  "  fix   the  order sync "  ',
+    ]
+    for (const raw of cases) {
+      const normalized = normalizeSummary(raw)
+      expect(normalized, String(raw)).toBeDefined()
+      const title = normalized ?? ''
+      // The two facts the core would otherwise impose on the plugin's behalf: it
+      // never silently cuts the title, and it never reduces it to empty.
+      expect(Buffer.byteLength(title, 'utf8'), String(raw)).toBeLessThanOrEqual(80)
+      // `normalizeSessionTitle` is the core's own `cleanTitleText` + byte cut, so
+      // an unchanged round trip is exactly the contract: the core finds nothing
+      // to strip and nothing to truncate.
+      expect(normalizeSessionTitle(title, 80), String(raw)).toBe(title)
     }
   })
 })

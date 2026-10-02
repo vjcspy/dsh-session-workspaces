@@ -139,6 +139,7 @@ describe('the map a read publishes', () => {
       candidates: ['k', 'tinybots'],
       unknownLabel: 'unknown workspace',
       backfill: { running: false, total: 0, pending: 3, done: 0, classified: 0, failed: 0, skipped: 0 },
+      titleProvider: 'unavailable',
     })
     expect(Object.keys(map.sessions).sort()).toEqual(['s1', 's2'])
     expect(map.sessions['s1']).toEqual({ workspace: 'k', pinned: false })
@@ -146,6 +147,9 @@ describe('the map a read publishes', () => {
     expect(map.groups).toHaveLength(1)
     expect(map.candidates).toEqual(['k', 'tinybots'])
     expect(map.backfill.pending).toBe(3)
+    // The title status is published verbatim, so a misconfigured profile is
+    // observable without a log line.
+    expect(map.titleProvider).toBe('unavailable')
   })
 })
 

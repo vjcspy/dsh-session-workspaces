@@ -59,7 +59,7 @@ import { registerFirstPromptProjection } from './host/projection.ts'
 import { registerCatalogRoute, registerFencedRoutes, routeDeps } from './host/routes.ts'
 import type { LoggedEvent } from './host/session-log.ts'
 import { attachDomain, WorkspaceStore } from './host/store.ts'
-import { registerTitleProvider } from './host/title-provider.ts'
+import { registerTitleProvider, type TitleProviderStatus } from './host/title-provider.ts'
 
 /** Cordis plugin name and bundle id. */
 export const name = PLUGIN_ID
@@ -145,10 +145,15 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
     debug: message => { ctx.logger.debug(message) },
   })
 
+  // Whether this plugin owns the Conversation title, read per map request. It
+  // starts pessimistic and is set by the registration itself, so the field only
+  // ever reports what was ACTUALLY registered — there is no separate probe.
+  let titleProvider: TitleProviderStatus = 'unavailable'
+
   // Optional on purpose: this attaches a child plugin that waits for
   // `sessionTitle`, so the grouping half below never depends on the title
   // service being present, or on it mounting before this plugin.
-  registerTitleProvider(ctx, ledger)
+  registerTitleProvider(ctx, ledger, (status) => { titleProvider = status })
 
   registerFirstPromptProjection(ctx)
 
@@ -247,6 +252,7 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
       backfill,
       candidates: candidateLabels,
       unknownLabel: () => settings().unknownLabel,
+      titleProvider: () => titleProvider,
     }))
     void refreshWorkingDirectories()
   })

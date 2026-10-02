@@ -116,9 +116,15 @@ export interface BootOptions {
    *
    * `absent` (the default) proves the grouping half never depends on it; `open`
    * accepts the plugin's registration; `taken` reproduces a host where the
-   * shipped `session-title-llm` row got there first.
+   * shipped `session-title-llm` row holds the slot, so EVERY registration —
+   * the plugin's probe included — is refused with the singleton duplicate.
    */
   readonly sessionTitle?: 'absent' | 'open' | 'taken'
+  /**
+   * Make the title service refuse the plugin's registration with this message
+   * instead of accepting it — any refusal OTHER than the singleton duplicate.
+   */
+  readonly sessionTitleRefusal?: string | undefined
 }
 
 /**
@@ -202,8 +208,15 @@ export async function boot(options: BootOptions = {}): Promise<Composition> {
   if (options.sessionTitle === 'open' || options.sessionTitle === 'taken') {
     ctx.provide('sessionTitle', {
       register: (provider: SessionTitleProvider) => {
+        // A refusal the caller scripted: a validation error, a foreign plugin's
+        // provider — anything that is NOT the singleton duplicate.
+        if (options.sessionTitleRefusal !== undefined) {
+          throw new Error(options.sessionTitleRefusal)
+        }
         // The real service holds exactly one provider and says so in these words
-        // (`session-title/src/index.ts:471-475`).
+        // (`session-title/src/index.ts:471-475`); it also validates a candidate
+        // BEFORE looking for a duplicate, so any registration that arrives after
+        // the slot is taken fails with this message.
         if (options.sessionTitle === 'taken') {
           throw new Error('session-title provider "session-title-llm" is already registered')
         }

@@ -10,6 +10,8 @@
  * @module dsh-session-workspaces/wire
  */
 
+import type { TitleProviderStatus } from './host/title-provider.ts'
+
 /** One Session's classification, as the model decided it. */
 export interface LabelRecord {
   /** The accepted workspace label, verbatim. */
@@ -148,6 +150,16 @@ export interface MapPayload {
   readonly unknownLabel: string
   /** Backfill progress. */
   readonly backfill: BackfillStatus
+  /**
+   * Whether this plugin owns the Conversation title on this host.
+   *
+   * `unavailable` means the core `sessionTitle` service already had a provider
+   * when this plugin asked — in practice the shipped `session-title-llm` row
+   * still being enabled — so titles come from that provider. It is published here
+   * because a successful boot has no visible log sink for the plugin's own
+   * `warn`, so a misconfigured profile would otherwise fail silently.
+   */
+  readonly titleProvider: TitleProviderStatus
 }
 
 /** One group operation the fenced write route accepts. */

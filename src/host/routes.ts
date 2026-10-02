@@ -27,6 +27,7 @@ import { BACKFILL_PATH, CATALOG_PATH, MAP_PATH, MUTATE_PATH } from '../config.ts
 import type { Backfill } from './backfill.ts'
 import type { RouteCatalog } from './catalog.ts'
 import type { WorkspaceStore } from './store.ts'
+import type { TitleProviderStatus } from './title-provider.ts'
 import type { AssignmentRequest, GroupOperation, MapPayload, MutateRequest } from '../wire.ts'
 import { isGroupOperation } from '../wire.ts'
 
@@ -58,11 +59,13 @@ export interface FencedRouteDeps {
   readonly unknownLabel: () => string
   /** The current map payload; every route answers with it after a write. */
   readonly map: () => MapPayload
+  /** Whether this plugin owns the Conversation title on this host. */
+  readonly titleProvider: () => TitleProviderStatus
 }
 
 /**
  * Build the route dependencies from the store and the live settings.
- * @param input - store, backfill and live settings reads.
+ * @param input - store, backfill, live settings reads and the title status read.
  * @returns the deps every route shares, with the map read derived once.
  */
 export function routeDeps(input: {
@@ -70,6 +73,7 @@ export function routeDeps(input: {
   readonly backfill: Backfill
   readonly candidates: () => readonly string[]
   readonly unknownLabel: () => string
+  readonly titleProvider: () => TitleProviderStatus
 }): FencedRouteDeps {
   return {
     ...input,
@@ -77,6 +81,10 @@ export function routeDeps(input: {
       candidates: input.candidates(),
       unknownLabel: input.unknownLabel(),
       backfill: input.backfill.snapshot(),
+      // Read per call, never captured: the plugin's own registration attempt
+      // resolves asynchronously, so a map read that arrived first would otherwise
+      // freeze the pre-registration answer for the life of the host.
+      titleProvider: input.titleProvider(),
     }),
   }
 }
@@ -109,7 +117,8 @@ function text(value: unknown, max: number): string | undefined {
 }
 
 /**
- * The map read: placements, group records, the candidate set and backfill progress.
+ * The map read: placements, group records, the candidate set, backfill progress
+ * and whether this plugin owns the Conversation title.
  * @param deps - store, backfill and live settings.
  * @returns the route.
  */

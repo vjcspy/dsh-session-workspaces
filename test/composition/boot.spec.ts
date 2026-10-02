@@ -267,106 +267,35 @@ describe('the title half', () => {
     expect(labelOf(composition, 's1')).toBe('k')
   })
 
-  it('takes the seq from the request snapshot, never from the first element it is handed', async () => {
+  it('answers with the FIRST seq of the snapshot the service handed it, and only that one', async () => {
     const composition = await bootTracked({ sessionTitle: 'open' })
     await composition.ready()
     const session = composition.session('s1')
-    composition.turn(session, 'work on the k repo', ROUTE)
-    await composition.settle()
-    // A decided Session has no second decision to share, so this only proves the
-    // refusal; the seq itself is asserted on the shared-call case above and in
-    // `test/unit/title-provider.spec.ts`.
-    await expect(composition.title(session, [{ seq: 7, text: 'x' }]))
-      .rejects.toThrow(/already-decided/u)
-  })
-
-  it('leaves a Session with no summary to the core fallback instead of an empty title', async () => {
-    const composition = await bootTracked({ sessionTitle: 'open' })
-    await composition.ready()
-    composition.script([
-      { type: 'text-delta', index: 0, text: '{"label":"k","confidence":0.9}' },
-      { type: 'finish', reason: { kind: 'stop' } },
-    ] as readonly StreamChunk[])
-    const session = composition.session('s1')
+    // Hold the call open, so the title request shares the in-flight decision
+    // instead of being refused for arriving after it.
     composition.hold()
     composition.turn(session, 'work on the k repo', ROUTE)
-    const pending = composition.title(session, [{ seq: 1, text: 'work on the k repo' }])
+    // A two-message snapshot: the provider must name the first of them and nothing
+    // else. This is the only place the plugin's answer can be separated from its
+    // own prompt projection, because the service is what chooses the snapshot.
+    const pending = composition.title(session, [
+      { seq: 4, text: 'please fix the tinybots order sync' },
+      { seq: 9, text: 'and the report too' },
+    ])
     composition.release()
-    await expect(pending).rejects.toThrow(/without a summary/u)
-    await composition.settle()
-    // The label decision is untouched by the missing summary.
-    expect(labelOf(composition, 's1')).toBe('k')
-  })
-
-  it('warns loudly and keeps booting when the shipped title row is still registered', async () => {
-    const composition = await bootTracked({ sessionTitle: 'taken' })
-    await composition.ready()
-    expect(composition.titleProvider).toBeUndefined()
-    expect(composition.warnings).toHaveLength(1)
-    expect(composition.warnings[0]).toContain('already registered')
-    // The warning names the missing profile edit, because that is the fix.
-    expect(composition.warnings[0]).toContain('session-title-llm')
-    expect(composition.warnings[0]).toContain('disabled: true')
-    // The host booted: the grouping half still works end to end.
-    expect(composition.routes).toHaveLength(4)
-    const session = composition.session('s1')
-    composition.turn(session, 'work on the k repo', ROUTE)
-    await composition.settle()
-    expect(labelOf(composition, 's1')).toBe('k')
-  })
-
-  it('mounts the grouping half on a host with no title service at all', async () => {
-    const composition = await bootTracked()
-    await composition.ready()
-    expect(composition.titleProvider).toBeUndefined()
-    expect(composition.warnings).toEqual([])
-    const session = composition.session('s1')
-    composition.turn(session, 'work on the k repo', ROUTE)
-    await composition.settle()
-    expect(composition.llmCalls).toHaveLength(1)
-    expect(labelOf(composition, 's1')).toBe('k')
-  })
-})
-
-describe('the title half', () => {
-  it('registers ONE provider on the host title service, on the first prompt', async () => {
-    const composition = await bootTracked({ sessionTitle: 'open' })
-    await composition.ready()
-    expect(composition.titleProvider?.id).toBe('dsh-session-workspaces')
-    expect(composition.titleProvider?.automatic).toBe('first-prompt')
-    expect(composition.warnings).toEqual([])
-  })
-
-  it('serves the title from the ONE model call the classification already makes', async () => {
-    const composition = await bootTracked({ sessionTitle: 'open' })
-    await composition.ready()
-    const session = composition.session('s1')
-    // Hold the call open, so both halves ask while it is still in flight.
-    composition.hold()
-    composition.turn(session, 'work on the k repo', ROUTE)
-    const pending = composition.title(session, [{ seq: 1, text: 'work on the k repo' }])
-    expect(composition.llmCalls).toHaveLength(1)
-    composition.release()
-
     const result = await pending
-    expect(result.title).toBe('work on the k repo')
-    expect(result.messageSeqs).toEqual([1])
-    expect(result.model).toEqual(ROUTE)
+    expect(result.messageSeqs).toEqual([4])
     await composition.settle()
-    // One Session, one call, both outcomes.
-    expect(composition.llmCalls).toHaveLength(1)
-    expect(labelOf(composition, 's1')).toBe('k')
   })
 
-  it('takes the seq from the request snapshot, never from the first element it is handed', async () => {
+  it('refuses a title request for a Session it has already decided', async () => {
     const composition = await bootTracked({ sessionTitle: 'open' })
     await composition.ready()
     const session = composition.session('s1')
     composition.turn(session, 'work on the k repo', ROUTE)
     await composition.settle()
-    // A decided Session has no second decision to share, so this only proves the
-    // refusal; the seq itself is asserted on the shared-call case above and in
-    // `test/unit/title-provider.spec.ts`.
+    // No second decision exists to share, so the request is refused rather than
+    // answered from the first one.
     await expect(composition.title(session, [{ seq: 7, text: 'x' }]))
       .rejects.toThrow(/already-decided/u)
   })
@@ -416,5 +345,47 @@ describe('the title half', () => {
     await composition.settle()
     expect(composition.llmCalls).toHaveLength(1)
     expect(labelOf(composition, 's1')).toBe('k')
+  })
+
+  it('reports the precondition ONLY for the duplicate, and every other refusal as itself', async () => {
+    // The singleton refusal: the profile edit is the fix, so it is named.
+    const duplicate = await bootTracked({ sessionTitle: 'taken' })
+    await duplicate.ready()
+    expect(duplicate.warnings).toHaveLength(1)
+    expect(duplicate.warnings[0]).toContain('HARD PRECONDITION')
+    expect(duplicate.warnings[0]).toContain('session-title-llm')
+
+    // A service that refuses for any other reason — a validation error here — is
+    // NOT the profile's fault, so the precondition must not be named.
+    const other = await bootTracked({
+      sessionTitle: 'open',
+      sessionTitleRefusal: 'session-title provider automatic mode is invalid',
+    })
+    await other.ready()
+    expect(other.warnings).toHaveLength(1)
+    expect(other.warnings[0]).toContain('automatic mode is invalid')
+    expect(other.warnings[0]).not.toContain('HARD PRECONDITION')
+    expect(other.warnings[0]).not.toContain('session-title-llm')
+  })
+
+  it('publishes whether it owns the Conversation title on the fenced map route', async () => {
+    const read = async (composition: Composition): Promise<unknown> => {
+      const route = composition.routes.find(candidate => candidate.path === MAP_PATH)
+      const response = await route?.fetch(new Request(`http://127.0.0.1${MAP_PATH}`, { method: 'GET' }))
+      const payload = await response?.json() as { data: { titleProvider: unknown } }
+      return payload.data.titleProvider
+    }
+    // The plugin holds the title...
+    const owned = await bootTracked({ sessionTitle: 'open' })
+    await owned.ready()
+    expect(owned.warnings).toEqual([])
+    expect(await read(owned)).toBe('ok')
+
+    // ...and does not, because the shipped row got there first. This is the same
+    // state the guard warns about, made observable without a log — a successful
+    // boot has no visible log sink, so a `warn` reaches nobody.
+    const taken = await bootTracked({ sessionTitle: 'taken' })
+    await taken.ready()
+    expect(await read(taken)).toBe('unavailable')
   })
 })

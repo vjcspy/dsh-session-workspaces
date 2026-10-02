@@ -53,11 +53,15 @@ projection so a process restart cannot restart the count. Subagent Sessions are
 ignored.
 
 **That one call also returns the Conversation title.** Its answer carries a
-`summary` of at most five words beside the label, and the plugin's own
+`summary` beside the label — at most **5 words**, or at most **10 characters**
+when the language does not separate words with spaces — and the plugin's own
 `sessionTitle` provider hands that summary to the core title service. Both
 readers await ONE keyed decision, keyed by Session id (`src/host/decision.ts`),
 so a Session still costs exactly one model call — see
 [The conversation title](#the-conversation-title).
+
+**The backfill is outside that guarantee** (documented, not fixed): see
+[Backfill (opt-in)](#backfill-opt-in).
 
 **The work runs when the Session's `request/header` is committed, not when the
 prompt is.** `packages/core/agent-loop/src/agent.ts` appends the first
@@ -123,11 +127,38 @@ The same call carries the title. The model-facing answer is exactly:
 {"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 5 words>"}
 ```
 
-`summary` is normalized — surrounding quotes stripped, internal whitespace
-collapsed — and **truncated to its first five words**. The core title service
-bounds an accepted title by BYTES (`maxTitleBytes`, 80), not words, so a five-word
-limit has to be enforced in the plugin's own parser rather than asked for in the
-prompt alone. A missing, mistyped, empty or over-long `summary` never costs the
+`summary` is normalized — invisible characters stripped, surrounding quotes
+stripped, internal whitespace collapsed — and then bounded by three rules
+(`normalizeSummary`, `src/host/classifier.ts`):
+
+1. **A summary written with word spaces is at most 5 words**
+   (`MAX_SUMMARY_WORDS`), truncated to its first five.
+2. **A CJK summary — one that contains CJK characters and no whitespace at all —
+   is at most 10 characters** (`MAX_SUMMARY_CJK_CHARACTERS`). A whitespace-token
+   cap says nothing about a script that does not separate words with spaces: a
+   Chinese sentence counts as ONE word, and without this budget the core would
+   cut the accepted title itself, silently and mid-phrase, at `maxTitleBytes`.
+   10 is the core's own answer to the same case — the shipped sibling provider
+   aims for `targetCjkCharacters: 10`
+   (`deepseek-harness` `packages/bundle/base/cordis.patch.yml:63-68`,
+   `packages/session/session-title-llm/src/index.ts:200`) — so a title derived
+   here is never longer than one the core would have derived for itself.
+3. **Every summary is at most 80 bytes** (`MAX_SUMMARY_BYTES`, mirroring the
+   shipped `maxTitleBytes`), truncated on a **character** boundary so the partial
+   word survives instead of being dropped. This is the backstop that makes the
+   "the core never silently cuts our title" claim true for a long Latin word too:
+   five 40-character words are 200 bytes, and rule 1 alone would let the core do
+   the cutting.
+
+The 10-character budget applies to CJK only, deliberately: a single long LATIN
+word is a word, and ten characters is not a shorter form of it, so such a word is
+bounded by rule 3 alone. Invisible-only content (`U+200B`, `U+FEFF`, `U+2060`,
+`U+00AD`, controls) is stripped **before** the quote strip, so a value wrapped in
+quotes across a zero-width character still has its quotes recognised, and a
+summary that is nothing but invisible characters is reported as **no summary** —
+never as a title the core would strip to empty and reject.
+
+A missing, mistyped, empty, invisible-only or over-long `summary` never costs the
 Session its classification: the label is judged by the label rules alone.
 
 The plugin registers `{id: 'dsh-session-workspaces', automatic: 'first-prompt'}`
@@ -162,6 +193,47 @@ Without that row the plugin logs one loud warning naming this precondition and
 **keeps booting**: the sidebar grouping half and the core fallback title both
 keep working, and no classification-derived title appears. The disable and the
 plugin install belong in the same profile change.
+
+**The warning is invisible on a successful boot, and the state is published on the
+map route instead.** Measured in the container on 2026-10-02: with the
+`session-title-llm` row re-enabled, `error`, `warn`, `info` and `debug` probes
+logged from the plugin's own injection produced **zero** lines in the boot log,
+while a `process.stderr.write` marker beside them did appear — so **no logger
+level is visible**, and the reason is structural rather than a threshold:
+
+- the vendored `LoggerService` ships exactly one built-in exporter and it only
+  pushes into an in-memory ring buffer (`vendor/cordis/src/logger.ts:213-221`);
+- the only other exporter is `app-boot`'s startup collector, and its records are
+  read **solely when startup fails** (`packages/boot/app-boot/src/index.ts:984-988,1019-1021`);
+- the `dsh: …` lines a boot does print are written to stderr by the launcher and
+  the startup audit, not through `ctx.logger`.
+
+So the condition is also carried on the existing map response, as one additive
+field:
+
+```json
+{"success": true, "data": { "…": "…", "titleProvider": "ok" }}
+```
+
+`"ok"` means this plugin registered its `sessionTitle` provider; `"unavailable"`
+means the service refused the registration — in practice because it already had a
+provider, i.e. the precondition above — so titles come from that provider. The
+field is the OUTCOME of the register call, not an optimistic guess, and it is read
+per request rather than captured, so a map read that raced the registration does
+not freeze a stale answer. (An earlier revision probed the slot with a throwaway
+provider first; that probe was removed because its disposer does not free the
+core's slot synchronously, so the plugin ended up refused by its own probe while
+the map route still reported `unavailable`.) The log line is kept for hosts that
+do install a sink.
+
+**Only the duplicate gets the precondition message.** `SessionTitleService`
+validates a candidate *before* it looks for a duplicate
+(`session-title/src/index.ts:471-477`), so a bad `automatic` mode, a missing
+`generate`, or another plugin's provider all throw from the same call. Only the
+refusal carrying ``is already registered`` — the service's own singleton wording —
+is reported as this precondition; every other error is logged as itself and
+unmasked. The one coupling is that wording: the plugin cannot read which provider
+holds the slot, so the message is the only discriminant the service exposes.
 
 ## Durable state
 
@@ -203,7 +275,7 @@ measured, `401` without the cookie, `200` from the page.
 
 | Route | Body | Answer |
 | --- | --- | --- |
-| `GET /api/dsh-session-workspaces/map` | — | placements, groups, the candidate set, backfill progress |
+| `GET /api/dsh-session-workspaces/map` | — | placements, groups, the candidate set, backfill progress, and `titleProvider` (`ok`/`unavailable`) |
 | `POST /api/dsh-session-workspaces/mutate` | `{sessionId, workspace, group?}` or `{op: 'group.create'\|'group.rename'\|'group.delete'\|'group.removeMember', …}` | the map as it stands after the write |
 | `POST /api/dsh-session-workspaces/backfill` | `{action: 'start'\|'status'}` | backfill progress and the map |
 | `GET /api/dsh-session-workspaces/catalog` | — | the advertised `provider`/`model` routes, the providers that could not be enumerated, and the sample instant |
@@ -317,6 +389,25 @@ settings section offers an explicit, Human-triggered pass that:
 - resumes by skipping every Session that already carries a label or a pin, so a
   re-run costs nothing for settled work.
 
+### The backfill is OUTSIDE the one-call-per-Session guarantee
+
+Documented rather than fixed. The "exactly one model call per Session" promise
+holds for the live path, where the header-driven work and the title provider
+await ONE keyed decision. A Human-triggered backfill breaks it in two ways:
+
+- **It can classify a Session concurrently with a live decision that has not yet
+  been written durably.** The backfill reads stored Sessions and decides each
+  before it sees a label, while a live Session that has just committed its first
+  `request/header` may be mid-decision and not yet recorded — so the same Session
+  can be classified twice, in two calls, and the later write wins.
+- **It retries after a ledger failure.** A pass re-attempts Sessions that carry
+  no label, so a decision that failed and was never persisted is attempted again
+  on the next pass instead of being remembered as attempted.
+
+The cost stays bounded (the pass states one call per *undecided* Session and
+requires a second confirmation), and only the Human-triggered path is affected:
+no automatic path runs a second call for a Session.
+
 ## Gates
 
 ```sh
@@ -342,10 +433,12 @@ test through a generated `cordis.yml` that loads the BUILT artifact.
 The title half is covered in that same composition: the provider's result contract
 (title = summary, seqs from the request snapshot, throw when there is no summary,
 abort on the request signal), the summary parser's every shape (in-limit,
-over-long, quoted, padded, missing, empty, non-string), the exactly-one-call dedup
-when the header-driven path and the title provider ask for the same Session, and
-the registration guard (an already-registered provider warns and the host still
-boots).
+over-long, quoted, padded, missing, empty, non-string, CJK without whitespace,
+zero-width-only, and long Latin words that overrun the byte budget), the
+exactly-one-call dedup when the header-driven path and the title provider ask for
+the same Session, the registration guard (a duplicate warns with the precondition
+and the host still boots; any other refusal is reported as itself), and the
+`titleProvider` field on the map route in both states.
 
 An external plugin does not run the harness's `verify-client-ui-i18n` or its
 coverage gate; this plugin carries its own locale namespace and its own tests

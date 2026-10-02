@@ -28,6 +28,7 @@ import { sessionWorkspacesDomain } from './domain.ts'
 import type {
   BackfillStatus, GroupRecord, LabelRecord, MapPayload, PinRecord, SessionPlacement,
 } from '../wire.ts'
+import type { TitleProviderStatus } from './title-provider.ts'
 
 /**
  * The slice of one kv table this store uses.
@@ -295,13 +296,18 @@ export class WorkspaceStore {
 
   /**
    * The payload one map read publishes.
-   * @param input - candidate set, unknown label and backfill progress.
+   *
+   * `titleProvider` arrives as a live read rather than a captured value: the
+   * plugin's own registration attempt resolves asynchronously, so a map read that
+   * happened first must not freeze the pre-registration answer.
+   * @param input - candidate set, unknown label, backfill progress and title status.
    * @returns the map.
    */
   snapshot(input: {
     readonly candidates: readonly string[]
     readonly unknownLabel: string
     readonly backfill: BackfillStatus
+    readonly titleProvider: TitleProviderStatus
   }): MapPayload {
     const sessions: Record<string, SessionPlacement> = {}
     for (const [sessionId, placement] of this.placements()) sessions[sessionId] = placement
@@ -311,6 +317,7 @@ export class WorkspaceStore {
       candidates: [...input.candidates],
       unknownLabel: input.unknownLabel,
       backfill: input.backfill,
+      titleProvider: input.titleProvider,
     }
   }
 
