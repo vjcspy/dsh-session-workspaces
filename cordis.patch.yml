@@ -1,7 +1,7 @@
 # dsh-session-workspaces bundle patch: mounts the plugin on the host plane under
 # the stable id `dsh-session-workspaces` and its browser half on the web plane.
 #
-# The plugin provides three surfaces.
+# The plugin provides four surfaces.
 #
 # 1. A classification pass over the session event stream. On the FIRST human
 #    `user/message` of a top-level Session (the cadence `session-title` uses —
@@ -30,7 +30,16 @@
 #    cross-site `Origin`/`sec-fetch-site` before the body is read. A JSON
 #    content-type check is applied as defense in depth only.
 #
-# 3. A `settings.section` choosing the classification model. Every writable
+# 3. The Conversation title. The same call answers with a `summary` of at most
+#    five words beside the label, and the plugin registers its own provider with
+#    `ctx.sessionTitle` (`automatic: 'first-prompt'`) to publish it. Both readers
+#    await ONE keyed decision (key: Session id), so a Session still costs exactly
+#    one model call. The service holds ONE provider, so a profile MUST disable
+#    the shipped `session-title-llm` row (`- id: session-title-llm` with
+#    `disabled: true`) — without it the plugin logs one warning, keeps booting,
+#    and no classification-derived title appears.
+#
+# 4. A `settings.section` choosing the classification model. Every writable
 #    field is declared `volatile` in this plugin's `Config`, because a
 #    non-volatile field is refused by the settings write gate; a write commits
 #    into the running reference and emits `loader/volatile-update` instead of

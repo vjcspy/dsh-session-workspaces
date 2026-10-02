@@ -59,6 +59,9 @@ importers:
       '@deepseek-ai/dsh-session-query':
         specifier: link:../deepseek-harness/packages/session-query/session-query
         version: link:../deepseek-harness/packages/session-query/session-query
+      '@deepseek-ai/dsh-session-title':
+        specifier: link:../deepseek-harness/packages/session/session-title
+        version: link:../deepseek-harness/packages/session/session-title
       '@deepseek-ai/dsh-settings':
         specifier: link:../deepseek-harness/packages/settings/settings
         version: link:../deepseek-harness/packages/settings/settings

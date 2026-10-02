@@ -55,6 +55,7 @@
     "@deepseek-ai/dsh-session-persistence": ">=0.1.5-rc.1",
     "@deepseek-ai/dsh-session-projection": ">=0.1.5-rc.1",
     "@deepseek-ai/dsh-session-query": ">=0.1.5-rc.1",
+    "@deepseek-ai/dsh-session-title": ">=0.1.5-rc.1",
     "@deepseek-ai/dsh-settings": ">=0.1.5-rc.1",
     "@deepseek-ai/dsh-storage-domain": ">=0.1.5-rc.1",
     "@deepseek-ai/schemastery": ">=3.18.2",
@@ -80,6 +81,9 @@
       "optional": true
     },
     "@deepseek-ai/dsh-session-query": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session-title": {
       "optional": true
     },
     "@deepseek-ai/dsh-settings": {
@@ -113,6 +117,7 @@
     "@deepseek-ai/dsh-session-persistence": "link:../deepseek-harness/packages/session/session-persistence",
     "@deepseek-ai/dsh-session-projection": "link:../deepseek-harness/packages/session/session-projection",
     "@deepseek-ai/dsh-session-query": "link:../deepseek-harness/packages/session-query/session-query",
+    "@deepseek-ai/dsh-session-title": "link:../deepseek-harness/packages/session/session-title",
     "@deepseek-ai/dsh-settings": "link:../deepseek-harness/packages/settings/settings",
     "@deepseek-ai/dsh-storage": "link:../deepseek-harness/packages/storage/storage",
     "@deepseek-ai/dsh-storage-domain": "link:../deepseek-harness/packages/storage/storage-domain",

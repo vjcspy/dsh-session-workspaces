@@ -26,6 +26,12 @@
  * nothing and leaves the Session, its turn and the core title feature exactly
  * as they were.
  *
+ * The call answers TWICE from that one answer: it returns the sidebar label and
+ * a summary of at most five words, and the plugin's own `sessionTitle` provider
+ * hands that summary to the core title service as the Conversation title. Both
+ * readers go through ONE keyed decision (`./host/decision.ts`), so a Session
+ * costs exactly one model call — which is the whole point of merging them.
+ *
  * @module dsh-session-workspaces
  */
 
@@ -46,12 +52,14 @@ import type { Config as PluginConfig } from './schema.ts'
 import { Backfill, type StoredSessionRecord } from './host/backfill.ts'
 import { CandidateResolver } from './host/candidates.ts'
 import { RouteCatalog } from './host/catalog.ts'
-import { classify, resolveRoute, routeFromHeader, type SessionRoute } from './host/classifier.ts'
+import { routeFromHeader, type SessionRoute } from './host/classifier.ts'
+import { DecisionLedger } from './host/decision.ts'
 import { sessionWorkspacesDomain } from './host/domain.ts'
 import { registerFirstPromptProjection } from './host/projection.ts'
 import { registerCatalogRoute, registerFencedRoutes, routeDeps } from './host/routes.ts'
 import type { LoggedEvent } from './host/session-log.ts'
 import { attachDomain, WorkspaceStore } from './host/store.ts'
+import { registerTitleProvider } from './host/title-provider.ts'
 
 /** Cordis plugin name and bundle id. */
 export const name = PLUGIN_ID
@@ -78,13 +86,6 @@ export const Config = PluginConfigSchema
  */
 export function apply(ctx: Context, config: PluginConfig = {}): void {
   const resolver = new CandidateResolver()
-  // Sessions whose first prompt has already been attempted and did NOT produce
-  // a decision. A Session commits several `request/header` events per turn
-  // (`initial`/`change`/`series`), so without this a provider failure would
-  // spend one model call per header, forever. A SUCCESSFUL decision is not
-  // remembered here: it is durable (`store.isDecided`), so this set holds only
-  // the failures and a restart clears them.
-  const settled = new Set<string>()
   let storedWorkingDirectories: string[] = []
   let disposed = false
   let store: WorkspaceStore | undefined
@@ -121,6 +122,34 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
     return [...new Set([...live, ...storedWorkingDirectories])]
   }
 
+  // ONE decision per Session, shared by the event path below and the title
+  // provider: if both ask, they await the SAME `ctx.llm.stream` call. The
+  // per-Session failure guard that used to live here now lives inside it, so the
+  // "one attempt per Session" rule holds on both paths.
+  const ledger = new DecisionLedger({
+    stream: options => ctx.llm.stream(options),
+    store: () => store,
+    settings: () => {
+      const live = settings()
+      return {
+        enabled: live.enabled,
+        provider: live.provider,
+        model: live.model,
+        candidates: candidateLabels(),
+        unknownLabel: live.unknownLabel,
+        threshold: live.threshold,
+      }
+    },
+    promptOf: session => firstPromptOf(ctx, session),
+    routeOf: session => routeOf(session),
+    debug: message => { ctx.logger.debug(message) },
+  })
+
+  // Optional on purpose: this attaches a child plugin that waits for
+  // `sessionTitle`, so the grouping half below never depends on the title
+  // service being present, or on it mounting before this plugin.
+  registerTitleProvider(ctx, ledger)
+
   registerFirstPromptProjection(ctx)
 
   // A settings write commits into the running volatile reference and emits this
@@ -145,53 +174,16 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
 
   /**
    * Classify one Session's first prompt, if its route and prompt are both known.
+   *
+   * The ledger reports the outcome once, so a Session that commits several
+   * headers per turn — `initial`/`change`/`series` — adds no model call and no
+   * second line about the same decision.
    * @param session - the Session whose header was just committed.
    */
   const attempt = async (session: Session): Promise<void> => {
-    const current = store
     const sessionId = String(session.id)
-    if (current === undefined) return
-    if (settled.has(sessionId)) return
-    if (!settings().enabled) return
-    // A decision already exists, or a Human pinned it: never re-decide.
-    if (current.isDecided(sessionId)) return
-    // Subagent Sessions are children of the Session that spawned them; the
-    // first-count condition is the same one `session-title` uses.
-    if (session.header.parentSession !== undefined) return
-    // The prompt comes from this plugin's own projection, so it is the SAME
-    // fact a restart replays rather than an in-memory capture that a reload
-    // would lose.
-    const state = ctx.sessionProjections.stateOf(session, FIRST_PROMPT_PROJECTION)
-    if (state === undefined || state.count !== 1 || state.prompt === null) return
-    const live = settings()
-    // Resolved HERE, where the route exists — never earlier and never guessed.
-    const route = resolveRoute(
-      { provider: live.provider, model: live.model },
-      routeOf(session),
-    )
-    // No route even now (an incomplete header, or a request that dispatched on
-    // nothing): record nothing and leave the Session on core grouping.
-    if (route.source === 'none') return
-    settled.add(sessionId)
     try {
-      const outcome = await classify({ stream: options => ctx.llm.stream(options) }, {
-        provider: route.provider,
-        model: route.model,
-        prompt: state.prompt,
-        candidates: candidateLabels(),
-        unknownLabel: live.unknownLabel,
-        threshold: live.threshold,
-      })
-      if (!outcome.ok) {
-        ctx.logger.debug(`${PLUGIN_ID}: ${sessionId} not classified (${outcome.reason}): ${outcome.message}`)
-        return
-      }
-      const written = await current.recordLabel(sessionId, outcome.label, outcome.confidence)
-      // The decision is durable now, so the in-memory guard is no longer needed.
-      settled.delete(sessionId)
-      ctx.logger.debug(
-        `${PLUGIN_ID}: ${sessionId} → ${outcome.label} (${String(outcome.confidence)}) via ${route.source} ${route.provider}/${route.model}${written ? '' : ' — pinned, not written'}`,
-      )
+      await ledger.decide(session)
     } catch (error) {
       // The classification is an auxiliary nicety: it must never disturb the
       // Session, its turn, or the core title feature.
@@ -265,7 +257,7 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
   ctx.effect(() => () => {
     disposed = true
     clearInterval(sampler)
-    settled.clear()
+    ledger.clear()
     const closing = store
     store = undefined
     if (closing !== undefined) void closing.close()
@@ -286,6 +278,20 @@ function readVolatile<T>(value: Volatile<T> | T | undefined, fallback: T): T {
 /** The Session's own logged route, from its live request header. */
 function routeOf(session: Session): SessionRoute | undefined {
   return routeFromHeader(session.requestHeader())
+}
+
+/**
+ * The Session's first human prompt, when exactly one is committed.
+ *
+ * Read from this plugin's own projection rather than captured in memory, so it
+ * is the SAME fact a restart replays rather than a capture a reload would lose.
+ * @param ctx - host context.
+ * @param session - the Session to read.
+ * @returns the prompt, or undefined when the Session is not on its first message.
+ */
+function firstPromptOf(ctx: Context, session: Session): string | undefined {
+  const state = ctx.sessionProjections.stateOf(session, FIRST_PROMPT_PROJECTION)
+  return state !== undefined && state.count === 1 && state.prompt !== null ? state.prompt : undefined
 }
 
 /** Every stored Session, reduced to the facts the backfill reads. */

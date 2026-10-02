@@ -10,8 +10,8 @@
 import { describe, expect, it } from 'vitest'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
-  classify, parseClassification, resolveRoute, routeFromHeader, CLASSIFIER_SYSTEM_PROMPT,
-  buildUserMessage, MAX_PROMPT_CHARS,
+  classify, normalizeSummary, parseClassification, resolveRoute, routeFromHeader,
+  CLASSIFIER_SYSTEM_PROMPT, buildUserMessage, MAX_PROMPT_CHARS, MAX_SUMMARY_WORDS,
 } from '../../src/host/classifier.ts'
 
 /** The candidate set every case validates against. */
@@ -40,9 +40,13 @@ async function run(
 }
 
 /** A clean answer: one text block, then `stop`. */
-function answer(label: string, confidence: number): StreamChunk[] {
+function answer(label: string, confidence: number, summary?: unknown): StreamChunk[] {
   return [
-    { type: 'text-delta', index: 0, text: JSON.stringify({ label, confidence }) },
+    {
+      type: 'text-delta',
+      index: 0,
+      text: JSON.stringify(summary === undefined ? { label, confidence } : { label, confidence, summary }),
+    },
     { type: 'finish', reason: { kind: 'stop' } },
   ] as StreamChunk[]
 }
@@ -211,5 +215,114 @@ describe('classify', () => {
     expect(message).toContain('unknown workspace')
     expect(message).toContain('[truncated]')
     expect(message.length).toBeLessThan(MAX_PROMPT_CHARS + 1_000)
+  })
+})
+
+describe('normalizeSummary', () => {
+  it('keeps a summary inside the word limit', () => {
+    expect(normalizeSummary('fix order sync')).toBe('fix order sync')
+  })
+
+  it('truncates to the first five words', () => {
+    expect(normalizeSummary('fix the tinybots order sync bug now')).toBe('fix the tinybots order sync')
+    expect(normalizeSummary('fix the tinybots order sync bug now')?.split(' ')).toHaveLength(MAX_SUMMARY_WORDS)
+    expect(normalizeSummary('one two three four five six')).toBe('one two three four five')
+    expect(MAX_SUMMARY_WORDS).toBe(5)
+  })
+
+  it('drops the quotes a model wraps the value in', () => {
+    expect(normalizeSummary('"fix the order sync bug"')).toBe('fix the order sync bug')
+    expect(normalizeSummary("'fix the order sync bug'")).toBe('fix the order sync bug')
+    expect(normalizeSummary('\u201cfix it\u201d')).toBe('fix it')
+    expect(normalizeSummary('""')).toBeUndefined()
+    expect(normalizeSummary('"')).toBeUndefined()
+  })
+
+  it('collapses the whitespace inside and around the value', () => {
+    expect(normalizeSummary('  fix   the\torder\nsync  bug  ')).toBe('fix the order sync bug')
+  })
+
+  it('answers "no summary" for a value that is not a usable string', () => {
+    for (const raw of [undefined, null, 42, true, {}, [], '', '   ', '\t\n']) {
+      expect(normalizeSummary(raw), String(raw)).toBeUndefined()
+    }
+  })
+})
+
+describe('parseClassification with a summary', () => {
+  const input = { candidates: CANDIDATES, unknownLabel: 'unknown workspace', threshold: 0.5 }
+
+  it('carries an in-limit summary alongside the label', () => {
+    expect(parseClassification('{"label":"k","confidence":0.9,"summary":"fix order sync"}', input))
+      .toEqual({ label: 'k', confidence: 0.9, summary: 'fix order sync' })
+  })
+
+  it('truncates an over-long summary without touching the label', () => {
+    expect(parseClassification('{"label":"k","confidence":0.9,"summary":"fix the tinybots order sync bug now"}', input))
+      .toEqual({ label: 'k', confidence: 0.9, summary: 'fix the tinybots order sync' })
+  })
+
+  it('normalizes a quoted and padded summary', () => {
+    // `JSON.stringify` writes the escaped quotes a model actually produces.
+    const text = JSON.stringify({ label: 'k', confidence: 0.9, summary: '  "  fix   the  order sync "  ' })
+    expect(parseClassification(text, input))
+      .toEqual({ label: 'k', confidence: 0.9, summary: 'fix the order sync' })
+  })
+
+  it('records the answer with no summary at all when the field is unusable', () => {
+    const values: readonly unknown[] = [undefined, 42, true, null, {}, ['a'], '', '   ', '"']
+    for (const value of values) {
+      const text = JSON.stringify(
+        value === undefined
+          ? { label: 'k', confidence: 0.9 }
+          : { label: 'k', confidence: 0.9, summary: value },
+      )
+      // The label decision is untouched: a broken summary must never cost a
+      // Session its classification.
+      expect(parseClassification(text, input), text).toEqual({ label: 'k', confidence: 0.9 })
+    }
+  })
+
+  it('carries the summary on an out-of-set label too — it describes the same prompt', () => {
+    expect(parseClassification('{"label":"shopify","confidence":0.99,"summary":"fix order sync"}', input))
+      .toEqual({ label: 'unknown workspace', confidence: 0.99, summary: 'fix order sync' })
+  })
+
+  it('carries the summary on a below-threshold answer too', () => {
+    expect(parseClassification('{"label":"k","confidence":0.2,"summary":"fix order sync"}', input))
+      .toEqual({ label: 'unknown workspace', confidence: 0.2, summary: 'fix order sync' })
+  })
+})
+
+describe('classify with a summary', () => {
+  it('asks for the summary in the model-facing JSON shape', () => {
+    expect(CLASSIFIER_SYSTEM_PROMPT).toContain(
+      '{"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 5 words>"}',
+    )
+  })
+
+  it('carries the summary on a recorded answer', async () => {
+    const { outcome } = await run(answer('tinybots', 0.9, 'fix order sync'))
+    expect(outcome).toMatchObject({ ok: true, label: 'tinybots', confidence: 0.9, summary: 'fix order sync' })
+  })
+
+  it('omits the summary — and keeps the label — when the answer carries none', async () => {
+    const { outcome } = await run(answer('tinybots', 0.9))
+    expect(outcome).toMatchObject({ ok: true, label: 'tinybots', confidence: 0.9 })
+    expect(outcome.ok && 'summary' in outcome).toBe(false)
+  })
+
+  it('keeps the label when the summary field is not a string', async () => {
+    const { outcome } = await run(answer('tinybots', 0.9, 7))
+    expect(outcome).toMatchObject({ ok: true, label: 'tinybots', confidence: 0.9 })
+    expect(outcome.ok && 'summary' in outcome).toBe(false)
+  })
+
+  it('still records nothing for an unparseable answer, summary or not', async () => {
+    const { outcome } = await run([
+      { type: 'text-delta', index: 0, text: 'a summary but no label' },
+      finish({ kind: 'stop' }),
+    ])
+    expect(outcome).toMatchObject({ ok: false, reason: 'malformed' })
   })
 })

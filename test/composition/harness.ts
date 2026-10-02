@@ -21,6 +21,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { SessionSeq, type Session } from '@deepseek-ai/dsh-session'
+import type { SessionTitleProvider, SessionTitleProviderResult } from '@deepseek-ai/dsh-session-title'
 import { FakeFacility } from '../support/fake-domain.ts'
 import type { RegisteredRoute } from '../support/fake-ctx.ts'
 
@@ -59,6 +61,10 @@ export interface Composition {
   readonly facility: FakeFacility
   /** Every `llm.stream` call, in order. */
   readonly llmCalls: GenerateOptions[]
+  /** The provider this plugin registered with the host title service, when it could. */
+  readonly titleProvider: SessionTitleProvider | undefined
+  /** Every `warn` line the host logged, in order. */
+  readonly warnings: string[]
   /** Script the chunks the next call streams. */
   script(chunks: readonly StreamChunk[]): void
   /** Script a rejection for the next call. */
@@ -77,6 +83,20 @@ export interface Composition {
   projection(state: { count: number; seq: number | null; prompt: string | null } | undefined): void
   /** Wait until the plugin has opened its storage unit. */
   ready(): Promise<void>
+  /**
+   * Ask the plugin's registered title provider for a title, the way the core
+   * service does: a Session carrier, the eligible human messages as the service
+   * snapshots them, and a cancellation signal.
+   */
+  title(
+    session: StubSession,
+    messages: readonly { readonly seq: number; readonly text: string }[],
+    signal?: AbortSignal,
+  ): Promise<SessionTitleProviderResult>
+  /** Hold the next `llm.stream` call open until {@link release}. */
+  hold(): void
+  /** Release every held `llm.stream` call. */
+  release(): void
   /** Let pending microtasks and timers settle. */
   settle(ms?: number): Promise<void>
   /** Unmount everything. */
@@ -91,6 +111,14 @@ export interface BootOptions {
   readonly model?: string
   /** Mount the plugin row at all; default true. */
   readonly withPlugin?: boolean
+  /**
+   * How the host's `sessionTitle` service appears.
+   *
+   * `absent` (the default) proves the grouping half never depends on it; `open`
+   * accepts the plugin's registration; `taken` reproduces a host where the
+   * shipped `session-title-llm` row got there first.
+   */
+  readonly sessionTitle?: 'absent' | 'open' | 'taken'
 }
 
 /**
@@ -106,7 +134,7 @@ export async function boot(options: BootOptions = {}): Promise<Composition> {
   const llmCalls: GenerateOptions[] = []
   const facility = new FakeFacility()
   let scripted: readonly StreamChunk[] = [
-    { type: 'text-delta', index: 0, text: '{"label":"k","confidence":0.9}' },
+    { type: 'text-delta', index: 0, text: '{"label":"k","confidence":0.9,"summary":"work on the k repo"}' },
     { type: 'finish', reason: { kind: 'stop' } },
   ] as readonly StreamChunk[]
   let scriptedThrow: string | undefined
@@ -116,6 +144,12 @@ export async function boot(options: BootOptions = {}): Promise<Composition> {
     prompt: 'work on the k repo',
   }
   const listeners: ((session: StubSession, event: StubEvent) => void)[] = []
+  const warnings: string[] = []
+  let titleProvider: SessionTitleProvider | undefined
+  // The gate a held `llm.stream` call waits on. Holding one call open is what
+  // lets a spec ask the title provider for the SAME in-flight decision.
+  let gate: Promise<void> | undefined
+  let openGate: (() => void) | undefined
 
   ctx.provide('storageDomain', {
     open: async (spec: unknown) => await facility.open(spec as never),
@@ -127,7 +161,10 @@ export async function boot(options: BootOptions = {}): Promise<Composition> {
         const message = scriptedThrow
         return (async function* (): AsyncIterable<StreamChunk> { throw new Error(message) })()
       }
-      return (async function* () { for (const chunk of scripted) yield chunk })()
+      return (async function* () {
+        if (gate !== undefined) await gate
+        for (const chunk of scripted) yield chunk
+      })()
     },
     // The advertised route catalog the settings control reads.
     listProviders: () => [{ id: 'fixture-p' }],
@@ -159,6 +196,31 @@ export async function boot(options: BootOptions = {}): Promise<Composition> {
           if (at >= 0) routes.splice(at, 1)
         }
       },
+    },
+  })
+
+  if (options.sessionTitle === 'open' || options.sessionTitle === 'taken') {
+    ctx.provide('sessionTitle', {
+      register: (provider: SessionTitleProvider) => {
+        // The real service holds exactly one provider and says so in these words
+        // (`session-title/src/index.ts:471-475`).
+        if (options.sessionTitle === 'taken') {
+          throw new Error('session-title provider "session-title-llm" is already registered')
+        }
+        titleProvider = provider
+        return async () => { titleProvider = undefined }
+      },
+    })
+  }
+  // The host's own log sink: the registration guard's warning is behaviour, so
+  // the harness reads what the plugin logged instead of assuming it.
+  ctx.logger.exporter({
+    // The default level the real host registers (`packages/boot/app-boot/src/index.ts:985`),
+    // so a `warn` reaches this sink exactly as it reaches the host's.
+    levels: { default: 2 },
+    export: (message) => {
+      if (message.type !== 'warn') return
+      warnings.push(message.args.map(arg => String(arg)).join(' '))
     },
   })
 
@@ -209,6 +271,8 @@ export async function boot(options: BootOptions = {}): Promise<Composition> {
     routes,
     facility,
     llmCalls,
+    warnings,
+    get titleProvider() { return titleProvider },
     script: (chunks) => { scripted = chunks; scriptedThrow = undefined },
     scriptThrow: (message) => { scriptedThrow = message },
     session: (id, overrides = {}) => {
@@ -233,6 +297,25 @@ export async function boot(options: BootOptions = {}): Promise<Composition> {
       composition.fire(session, requestHeader(session.route?.provider ?? '', session.route?.model ?? ''))
     },
     projection: (state) => { projection = state },
+    title: async (session, messages, signal = new AbortController().signal) => {
+      if (titleProvider === undefined) throw new Error('the plugin registered no sessionTitle provider')
+      return await titleProvider.generate({
+        session: session as unknown as Session,
+        messages: messages.map(message => ({ seq: SessionSeq(message.seq), text: message.text })),
+        signal,
+      })
+    },
+    hold: () => {
+      if (gate === undefined) gate = new Promise<void>((resolve) => { openGate = resolve })
+    },
+    release: () => {
+      const open = openGate
+      // Cleared BEFORE the held call resumes, so a call started afterwards is
+      // never held by a gate nobody will release again.
+      gate = undefined
+      openGate = undefined
+      open?.()
+    },
     ready: async () => {
       for (let attempt = 0; attempt < 200 && facility.domain === undefined; attempt += 1) {
         await new Promise(resolve => setTimeout(resolve, 5))

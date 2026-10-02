@@ -1,6 +1,13 @@
 /**
  * The classifier: one hidden auxiliary model call that decides which Aweave
- * workspace a conversation belongs to.
+ * workspace a conversation belongs to, and summarises its first prompt.
+ *
+ * The summary rides that decision rather than costing a call of its own: the
+ * answer carries a `summary` of at most {@link MAX_SUMMARY_WORDS} words beside
+ * the label, and the plugin's `sessionTitle` provider publishes it as the
+ * Conversation title. It is decoration on the label decision, so a missing or
+ * mistyped one never costs the Session its classification, and it is never
+ * persisted.
  *
  * Three properties are contractual, and each is visible in the code below:
  *
@@ -28,6 +35,16 @@ import { CLASSIFY_TIMEOUT_MS } from '../config.ts'
 
 /** How much of a first prompt the classifier is shown; a longer one is truncated. */
 export const MAX_PROMPT_CHARS = 8_000
+
+/**
+ * Hard limit on the words in the summary the same answer carries.
+ *
+ * The prompt asks for at most this many, but the title service bounds an
+ * accepted title in BYTES (`maxTitleBytes`), not words, so the aim has to be
+ * enforced here: an over-long summary is truncated to its first
+ * {@link MAX_SUMMARY_WORDS} words rather than discarded.
+ */
+export const MAX_SUMMARY_WORDS = 5
 
 /** Where a resolved route came from. `none` means: do not call. */
 export type RouteSource = 'config' | 'session' | 'none'
@@ -101,9 +118,12 @@ export const CLASSIFIER_SYSTEM_PROMPT = [
   '  signal points somewhere outside the candidate list.',
   '- Report your confidence as a number between 0 and 1. Use a value below 0.5 when',
   '  you are guessing; a low-confidence answer is treated as the unknown label.',
+  '- Also summarise the message itself in `summary`: at most 5 words, a phrase',
+  '  rather than a sentence, in the language the message is written in, naming what',
+  '  the Human wants done. It becomes the conversation title.',
   '',
   'Answer with a single JSON object and nothing else:',
-  '{"label": "<one candidate label>", "confidence": <number between 0 and 1>}',
+  '{"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 5 words>"}',
 ].join('\n')
 
 /**
@@ -138,6 +158,14 @@ export interface ClassificationAnswer {
   readonly label: string
   /** Confidence the model reported, clamped to `[0, 1]`. */
   readonly confidence: number
+  /**
+   * The model's summary of the prompt, normalized to at most
+   * {@link MAX_SUMMARY_WORDS} words, when it wrote a usable one.
+   *
+   * Independent of the label: a summary on an out-of-set or low-confidence
+   * answer still describes the same prompt. Never persisted.
+   */
+  readonly summary?: string | undefined
 }
 
 /** How one answer is validated. */
@@ -170,12 +198,52 @@ export function parseClassification(text: string, input: ParseInput): Classifica
   const confidence = typeof rawConfidence === 'number' && Number.isFinite(rawConfidence)
     ? Math.min(1, Math.max(0, rawConfidence))
     : 0
+  const summary = normalizeSummary(raw['summary'])
   return {
     // Below the threshold the answer is the unknown label, not a rejection: the
     // Session still lands somewhere explicit and the Human can correct it.
     label: confidence < input.threshold ? input.unknownLabel : canonicalLabel(reported.trim(), input),
     confidence,
+    // Absent rather than explicitly `undefined`, so an answer that carries no
+    // usable summary is exactly the answer this parser returned before.
+    ...(summary === undefined ? {} : { summary }),
   }
+}
+
+/** Quote characters a model wraps a summary in, inside the JSON string it writes. */
+const SUMMARY_QUOTES = new Set(['"', "'", '`', '\u201c', '\u201d', '\u2018', '\u2019'])
+
+/**
+ * Normalize the answer's `summary` field.
+ *
+ * The summary decorates the label decision, so nothing here can make an answer
+ * unparseable: a missing, mistyped or empty value yields no summary at all, and
+ * an over-long one is truncated to its first {@link MAX_SUMMARY_WORDS} words
+ * instead of being rejected.
+ * @param raw - the answer's `summary` value, of unknown type.
+ * @returns the normalized summary, or undefined when the answer carried none.
+ */
+export function normalizeSummary(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const words = stripQuotes(raw).split(/\s+/u).filter(word => word !== '')
+  if (words.length === 0) return undefined
+  return words.slice(0, MAX_SUMMARY_WORDS).join(' ')
+}
+
+/**
+ * Drop the quotes a model wraps one field value in, and the whitespace inside them.
+ * @param text - the raw field value.
+ * @returns the value without its surrounding quotes.
+ */
+function stripQuotes(text: string): string {
+  // Trimmed FIRST: a model pads the value it quotes (`  "  fix it "  `), so a
+  // quote search that started at the raw ends would find only whitespace.
+  const trimmed = text.trim()
+  let start = 0
+  let end = trimmed.length
+  while (start < end && SUMMARY_QUOTES.has(trimmed.charAt(start))) start += 1
+  while (end > start && SUMMARY_QUOTES.has(trimmed.charAt(end - 1))) end -= 1
+  return trimmed.slice(start, end).trim()
 }
 
 /**
@@ -238,6 +306,8 @@ export type ClassificationOutcome =
     readonly ok: true
     readonly label: string
     readonly confidence: number
+    /** The model's normalized summary, when the answer carried a usable one. */
+    readonly summary?: string | undefined
     /** The raw assembled text, kept for the diagnostics a test asserts on. */
     readonly text: string
   }
@@ -331,7 +401,13 @@ export async function classify(
     threshold: request.threshold,
   })
   if (answer === undefined) return { ok: false, reason: 'malformed', message: text.slice(0, 400) }
-  return { ok: true, label: answer.label, confidence: answer.confidence, text }
+  return {
+    ok: true,
+    label: answer.label,
+    confidence: answer.confidence,
+    text,
+    ...(answer.summary === undefined ? {} : { summary: answer.summary }),
+  }
 }
 
 /** Sentinel rejection for the deadline race; identity-compared, never surfaced. */

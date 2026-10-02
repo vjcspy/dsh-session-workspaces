@@ -52,6 +52,13 @@ filter and the "first eligible message" condition, read from a session
 projection so a process restart cannot restart the count. Subagent Sessions are
 ignored.
 
+**That one call also returns the Conversation title.** Its answer carries a
+`summary` of at most five words beside the label, and the plugin's own
+`sessionTitle` provider hands that summary to the core title service. Both
+readers await ONE keyed decision, keyed by Session id (`src/host/decision.ts`),
+so a Session still costs exactly one model call — see
+[The conversation title](#the-conversation-title).
+
 **The work runs when the Session's `request/header` is committed, not when the
 prompt is.** `packages/core/agent-loop/src/agent.ts` appends the first
 `user/message` at `:421` and only then calls `buildRequest` at `:425`, which
@@ -103,10 +110,58 @@ below-threshold or out-of-set answer becomes the configured unknown label.
 Provider error, deadline or unparseable output records nothing and does not
 disturb the Session, its turn, or the core title feature.
 
-The core title provider is **not replaced**: this plugin registers no
-`sessionTitle` provider at all, and the shipped
-`session-title-first-prompt-llm` still titles conversations (asserted in the
-session log).
+The plugin **owns the Conversation title now**, by registering its own
+`sessionTitle` provider. That is why the shipped provider row
+(`session-title-llm`) must be disabled in the profile — a hard precondition, see
+[The conversation title](#the-conversation-title).
+
+## The conversation title
+
+The same call carries the title. The model-facing answer is exactly:
+
+```json
+{"label": "<one candidate label>", "confidence": <number between 0 and 1>, "summary": "<at most 5 words>"}
+```
+
+`summary` is normalized — surrounding quotes stripped, internal whitespace
+collapsed — and **truncated to its first five words**. The core title service
+bounds an accepted title by BYTES (`maxTitleBytes`, 80), not words, so a five-word
+limit has to be enforced in the plugin's own parser rather than asked for in the
+prompt alone. A missing, mistyped, empty or over-long `summary` never costs the
+Session its classification: the label is judged by the label rules alone.
+
+The plugin registers `{id: 'dsh-session-workspaces', automatic: 'first-prompt'}`
+with `ctx.sessionTitle`, and reaches that service **optionally** through
+`ctx.inject(['sessionTitle'], …)`: the registration lives in a child plugin that
+waits for the service, so a host **without** it still mounts the grouping half.
+`generate` awaits the Session's one decision and answers with the summary, the
+seq of the FIRST element of `request.messages` (never an invented seq), and the
+route the classification actually ran on. It **throws** whenever no summary can be
+produced — no route, a provider error, the deadline, a malformed answer, an
+already-decided Session, an aborted request — which is what leaves the core's
+deterministic fallback title in place instead of writing an empty one. A Human
+rename still wins: the core's `source.kind === 'user'` pin is untouched.
+
+The summary is **never persisted**. The durable unit keeps its exact record
+shapes, so no migration and no orphaned classification.
+
+### HARD PRECONDITION — the shipped title row must be disabled
+
+`SessionTitleService.register` is a **singleton**: a second registration throws
+`session-title provider "<id>" is already registered`. The shipped
+`session-title-first-prompt-llm` provider (row id `session-title-llm`) is enabled
+by default through `dsh-base`, so the `web` profile MUST disable it:
+
+```yaml
+# $DSH_HOME/profiles/web/cordis.patch.yml
+- id: session-title-llm
+  disabled: true
+```
+
+Without that row the plugin logs one loud warning naming this precondition and
+**keeps booting**: the sidebar grouping half and the core fallback title both
+keep working, and no classification-derived title appears. The disable and the
+plugin install belong in the same profile change.
 
 ## Durable state
 
@@ -283,6 +338,14 @@ cannot be listed at all, the cache window, and the browser state that keeps the
 last good routes when a read fails), the provider's one-level / two-level /
 unclassified paths, the map cache, the menu actions, and one real-composition boot
 test through a generated `cordis.yml` that loads the BUILT artifact.
+
+The title half is covered in that same composition: the provider's result contract
+(title = summary, seqs from the request snapshot, throw when there is no summary,
+abort on the request signal), the summary parser's every shape (in-limit,
+over-long, quoted, padded, missing, empty, non-string), the exactly-one-call dedup
+when the header-driven path and the title provider ask for the same Session, and
+the registration guard (an already-registered provider warns and the host still
+boots).
 
 An external plugin does not run the harness's `verify-client-ui-i18n` or its
 coverage gate; this plugin carries its own locale namespace and its own tests

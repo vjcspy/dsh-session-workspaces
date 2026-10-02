@@ -236,3 +236,185 @@ describe('the classification cadence', () => {
     expect(payload.data.sessions['s1']).toEqual({ workspace: 'k', pinned: false })
   })
 })
+
+describe('the title half', () => {
+  it('registers ONE provider on the host title service, on the first prompt', async () => {
+    const composition = await bootTracked({ sessionTitle: 'open' })
+    await composition.ready()
+    expect(composition.titleProvider?.id).toBe('dsh-session-workspaces')
+    expect(composition.titleProvider?.automatic).toBe('first-prompt')
+    expect(composition.warnings).toEqual([])
+  })
+
+  it('serves the title from the ONE model call the classification already makes', async () => {
+    const composition = await bootTracked({ sessionTitle: 'open' })
+    await composition.ready()
+    const session = composition.session('s1')
+    // Hold the call open, so both halves ask while it is still in flight.
+    composition.hold()
+    composition.turn(session, 'work on the k repo', ROUTE)
+    const pending = composition.title(session, [{ seq: 1, text: 'work on the k repo' }])
+    expect(composition.llmCalls).toHaveLength(1)
+    composition.release()
+
+    const result = await pending
+    expect(result.title).toBe('work on the k repo')
+    expect(result.messageSeqs).toEqual([1])
+    expect(result.model).toEqual(ROUTE)
+    await composition.settle()
+    // One Session, one call, both outcomes.
+    expect(composition.llmCalls).toHaveLength(1)
+    expect(labelOf(composition, 's1')).toBe('k')
+  })
+
+  it('takes the seq from the request snapshot, never from the first element it is handed', async () => {
+    const composition = await bootTracked({ sessionTitle: 'open' })
+    await composition.ready()
+    const session = composition.session('s1')
+    composition.turn(session, 'work on the k repo', ROUTE)
+    await composition.settle()
+    // A decided Session has no second decision to share, so this only proves the
+    // refusal; the seq itself is asserted on the shared-call case above and in
+    // `test/unit/title-provider.spec.ts`.
+    await expect(composition.title(session, [{ seq: 7, text: 'x' }]))
+      .rejects.toThrow(/already-decided/u)
+  })
+
+  it('leaves a Session with no summary to the core fallback instead of an empty title', async () => {
+    const composition = await bootTracked({ sessionTitle: 'open' })
+    await composition.ready()
+    composition.script([
+      { type: 'text-delta', index: 0, text: '{"label":"k","confidence":0.9}' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ] as readonly StreamChunk[])
+    const session = composition.session('s1')
+    composition.hold()
+    composition.turn(session, 'work on the k repo', ROUTE)
+    const pending = composition.title(session, [{ seq: 1, text: 'work on the k repo' }])
+    composition.release()
+    await expect(pending).rejects.toThrow(/without a summary/u)
+    await composition.settle()
+    // The label decision is untouched by the missing summary.
+    expect(labelOf(composition, 's1')).toBe('k')
+  })
+
+  it('warns loudly and keeps booting when the shipped title row is still registered', async () => {
+    const composition = await bootTracked({ sessionTitle: 'taken' })
+    await composition.ready()
+    expect(composition.titleProvider).toBeUndefined()
+    expect(composition.warnings).toHaveLength(1)
+    expect(composition.warnings[0]).toContain('already registered')
+    // The warning names the missing profile edit, because that is the fix.
+    expect(composition.warnings[0]).toContain('session-title-llm')
+    expect(composition.warnings[0]).toContain('disabled: true')
+    // The host booted: the grouping half still works end to end.
+    expect(composition.routes).toHaveLength(4)
+    const session = composition.session('s1')
+    composition.turn(session, 'work on the k repo', ROUTE)
+    await composition.settle()
+    expect(labelOf(composition, 's1')).toBe('k')
+  })
+
+  it('mounts the grouping half on a host with no title service at all', async () => {
+    const composition = await bootTracked()
+    await composition.ready()
+    expect(composition.titleProvider).toBeUndefined()
+    expect(composition.warnings).toEqual([])
+    const session = composition.session('s1')
+    composition.turn(session, 'work on the k repo', ROUTE)
+    await composition.settle()
+    expect(composition.llmCalls).toHaveLength(1)
+    expect(labelOf(composition, 's1')).toBe('k')
+  })
+})
+
+describe('the title half', () => {
+  it('registers ONE provider on the host title service, on the first prompt', async () => {
+    const composition = await bootTracked({ sessionTitle: 'open' })
+    await composition.ready()
+    expect(composition.titleProvider?.id).toBe('dsh-session-workspaces')
+    expect(composition.titleProvider?.automatic).toBe('first-prompt')
+    expect(composition.warnings).toEqual([])
+  })
+
+  it('serves the title from the ONE model call the classification already makes', async () => {
+    const composition = await bootTracked({ sessionTitle: 'open' })
+    await composition.ready()
+    const session = composition.session('s1')
+    // Hold the call open, so both halves ask while it is still in flight.
+    composition.hold()
+    composition.turn(session, 'work on the k repo', ROUTE)
+    const pending = composition.title(session, [{ seq: 1, text: 'work on the k repo' }])
+    expect(composition.llmCalls).toHaveLength(1)
+    composition.release()
+
+    const result = await pending
+    expect(result.title).toBe('work on the k repo')
+    expect(result.messageSeqs).toEqual([1])
+    expect(result.model).toEqual(ROUTE)
+    await composition.settle()
+    // One Session, one call, both outcomes.
+    expect(composition.llmCalls).toHaveLength(1)
+    expect(labelOf(composition, 's1')).toBe('k')
+  })
+
+  it('takes the seq from the request snapshot, never from the first element it is handed', async () => {
+    const composition = await bootTracked({ sessionTitle: 'open' })
+    await composition.ready()
+    const session = composition.session('s1')
+    composition.turn(session, 'work on the k repo', ROUTE)
+    await composition.settle()
+    // A decided Session has no second decision to share, so this only proves the
+    // refusal; the seq itself is asserted on the shared-call case above and in
+    // `test/unit/title-provider.spec.ts`.
+    await expect(composition.title(session, [{ seq: 7, text: 'x' }]))
+      .rejects.toThrow(/already-decided/u)
+  })
+
+  it('leaves a Session with no summary to the core fallback instead of an empty title', async () => {
+    const composition = await bootTracked({ sessionTitle: 'open' })
+    await composition.ready()
+    composition.script([
+      { type: 'text-delta', index: 0, text: '{"label":"k","confidence":0.9}' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ] as readonly StreamChunk[])
+    const session = composition.session('s1')
+    composition.hold()
+    composition.turn(session, 'work on the k repo', ROUTE)
+    const pending = composition.title(session, [{ seq: 1, text: 'work on the k repo' }])
+    composition.release()
+    await expect(pending).rejects.toThrow(/without a summary/u)
+    await composition.settle()
+    // The label decision is untouched by the missing summary.
+    expect(labelOf(composition, 's1')).toBe('k')
+  })
+
+  it('warns loudly and keeps booting when the shipped title row is still registered', async () => {
+    const composition = await bootTracked({ sessionTitle: 'taken' })
+    await composition.ready()
+    expect(composition.titleProvider).toBeUndefined()
+    expect(composition.warnings).toHaveLength(1)
+    expect(composition.warnings[0]).toContain('already registered')
+    // The warning names the missing profile edit, because that is the fix.
+    expect(composition.warnings[0]).toContain('session-title-llm')
+    expect(composition.warnings[0]).toContain('disabled: true')
+    // The host booted: the grouping half still works end to end.
+    expect(composition.routes).toHaveLength(4)
+    const session = composition.session('s1')
+    composition.turn(session, 'work on the k repo', ROUTE)
+    await composition.settle()
+    expect(labelOf(composition, 's1')).toBe('k')
+  })
+
+  it('mounts the grouping half on a host with no title service at all', async () => {
+    const composition = await bootTracked()
+    await composition.ready()
+    expect(composition.titleProvider).toBeUndefined()
+    expect(composition.warnings).toEqual([])
+    const session = composition.session('s1')
+    composition.turn(session, 'work on the k repo', ROUTE)
+    await composition.settle()
+    expect(composition.llmCalls).toHaveLength(1)
+    expect(labelOf(composition, 's1')).toBe('k')
+  })
+})
