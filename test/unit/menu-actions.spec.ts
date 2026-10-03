@@ -9,16 +9,20 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import type { ConnectionFetchRoute } from '@deepseek-ai/dsh-client-connection'
 import { MUTATE_PATH } from '../../src/config.ts'
+import { mutate } from '../../src/client/api.ts'
+import { MapStore } from '../../src/client/state.ts'
 import { Backfill } from '../../src/host/backfill.ts'
 import { mutateRoute, routeDeps } from '../../src/host/routes.ts'
 import { WorkspaceStore } from '../../src/host/store.ts'
 import type { MapPayload, MutateRequest } from '../../src/wire.ts'
 import { FakeDomain } from '../support/fake-domain.ts'
 
-/** A route over a store, plus the store itself. */
+/** A route over a store, plus the store and the route itself. */
 function harness(): {
   readonly store: WorkspaceStore
+  readonly route: ConnectionFetchRoute
   readonly send: (body: MutateRequest) => Promise<MapPayload>
 } {
   let next = 0
@@ -52,7 +56,7 @@ function harness(): {
     const payload = await response.json() as { data: { map: MapPayload } }
     return payload.data.map
   }
-  return { store, send }
+  return { store, route, send }
 }
 
 describe('the menu actions', () => {
@@ -107,6 +111,55 @@ describe('the menu actions', () => {
     // The override stands: nothing re-decides a corrected Session.
     expect(await store.recordLabel('s1', 'whill', 0.99)).toBe(false)
     expect(store.placementOf('s1')).toEqual({ workspace: 'k', pinned: true })
+  })
+
+  it('RELEASES a Session to the core grouping by pinning the sentinel, and nothing re-decides it', async () => {
+    const { store, send } = harness()
+    await store.recordLabel('s1', 'k', 0.9)
+    const released = await send({ sessionId: 's1', workspace: 'unknown workspace' })
+    // The release is an ordinary assignment of the sentinel, so the Session stays
+    // DECIDED — which is the single guard the classifier consults before it
+    // spends a call — while the sentinel rule hands it to the core grouping.
+    expect(released.sessions['s1']).toEqual({ workspace: 'unknown workspace', pinned: true })
+    expect(store.isDecided('s1')).toBe(true)
+    expect(await store.recordLabel('s1', 'k', 0.99)).toBe(false)
+  })
+
+  it('lands a menu assignment through the browser store, posting exactly ONE request', async () => {
+    const { store, route } = harness()
+    const seed: MapPayload = {
+      sessions: {},
+      groups: [],
+      candidates: ['k', 'tinybots'],
+      unknownLabel: 'unknown workspace',
+      backfill: { running: false, total: 0, pending: 0, done: 0, classified: 0, failed: 0, skipped: 0 },
+      titleProvider: 'ok',
+    }
+    const state = new MapStore({ read: () => seed, write: () => {} })
+    const original = globalThis.fetch
+    const urls: string[] = []
+    // The REAL client transport over the REAL fenced route: what the menu drives
+    // in the page, with only the network hop replaced.
+    globalThis.fetch = async (input, init) => {
+      urls.push(String(input))
+      return await route.fetch(new Request(new URL(String(input), 'http://127.0.0.1'), init))
+    }
+    try {
+      const pending = state.assign({
+        request: { sessionId: 's1', workspace: 'tinybots' },
+        send: async () => await mutate({ sessionId: 's1', workspace: 'tinybots' }),
+      })
+      // Optimistic: the placement shows before the Host has answered.
+      expect(state.payload()?.sessions['s1']).toEqual({ workspace: 'tinybots', pinned: true })
+      await pending
+      expect(state.payload()?.sessions['s1']).toEqual({ workspace: 'tinybots', pinned: true })
+      expect(store.isPinned('s1')).toBe(true)
+      // One request, to the write route, and no read-back: a move never reaches a
+      // classification path, which the client half cannot call at all.
+      expect(urls).toEqual([MUTATE_PATH])
+    } finally {
+      globalThis.fetch = original
+    }
   })
 
   it('corrects a misclassification from the same menu and keeps the correction', async () => {

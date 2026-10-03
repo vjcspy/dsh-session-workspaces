@@ -189,6 +189,34 @@ describe(`POST ${MUTATE_PATH}`, () => {
     expect(map.sessions['s1']).toEqual({ workspace: 'k', pinned: true })
   })
 
+  it('refuses to create a group on the undecided workspace, while still accepting it as an assignment', async () => {
+    const deps = makeDeps()
+    const route = mutateRoute(deps)
+    const send = async (payload: unknown): Promise<{ status: number; payload: Record<string, unknown> }> => {
+      const response = await route.fetch(new Request(`http://127.0.0.1${MUTATE_PATH}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+      }))
+      return { status: response.status, payload: await body(response) }
+    }
+    const refused = await send({ op: 'group.create', workspace: 'unknown workspace', name: 'Release' })
+    expect(refused.status).toBe(400)
+    expect(refused.payload['error']).toMatchObject({ code: 'UNKNOWN_WORKSPACE' })
+    // Nothing was created: a group under the sentinel would render the
+    // `unknown workspace` root row the grouping deliberately stops serving.
+    expect(deps.store.groupsInOrder()).toEqual([])
+
+    // The sentinel is still a legal ASSIGNMENT, which is what makes a release
+    // possible; only group creation is refused.
+    const released = await send({ sessionId: 's1', workspace: 'unknown workspace' })
+    expect(released.status).toBe(200)
+    const releasedMap = (released.payload['data'] as { map: { sessions: Record<string, unknown> } }).map
+    expect(releasedMap.sessions['s1']).toEqual({ workspace: 'unknown workspace', pinned: true })
+
+    const created = await send({ op: 'group.create', workspace: 'k', name: 'Release' })
+    expect(created.status).toBe(200)
+    expect(deps.store.groupsInOrder()).toHaveLength(1)
+  })
+
   it('refuses a non-JSON body, a malformed body, blank fields and unknown references', async () => {
     const deps = makeDeps()
     const route = mutateRoute(deps)

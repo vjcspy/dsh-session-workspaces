@@ -26,6 +26,7 @@ import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-cli
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 
 import { LOCALE_NAMESPACE } from '../config.ts'
+import { newGroupTarget } from './grouping.ts'
 import type { MapState } from './state.ts'
 import type { MutateRequest } from '../wire.ts'
 import type { SessionWorkspacesTranslate } from './locales.ts'
@@ -216,6 +217,12 @@ export function MoveToGroupItem({
  *
  * Two writes, in order: the group must exist before the assignment can name it,
  * because the assignment resolves the group's workspace.
+ *
+ * The default target is the Session's own placement, which on an undecided
+ * Session is the undecided sentinel — so the flow asks for an explicit candidate
+ * instead: a group created on the sentinel would be the `unknown workspace` root
+ * row the grouping no longer serves. The fenced route refuses that workspace too,
+ * which is what keeps this a convenience rather than the enforcement point.
  * @param props - owner share, menu hooks, locale seat and this plugin's share.
  * @returns the entry.
  */
@@ -228,7 +235,7 @@ export function NewGroupItem({
   const [name, setName] = useState('')
   const map = useMap(read, subscribe)
   const write = useWrite(setMenuOpen)
-  const target = chosen ?? map?.sessions[sessionId]?.workspace
+  const target = chosen ?? newGroupTarget(map, sessionId)
   const candidates = map?.candidates ?? []
   return (
     <>

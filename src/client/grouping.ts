@@ -59,12 +59,45 @@ export function resolveGroupingPath(
   if (map === undefined) return undefined
   const placement = map.sessions[sessionId]
   if (placement === undefined) return undefined
-  const root: GroupingElement = { key: workspaceKey(placement.workspace), label: placement.workspace }
-  if (placement.group === undefined) return [root]
-  const group = map.groups.find(candidate => candidate.id === placement.group)
-  // A dangling group reference cannot reach here — the host resolves it at read
-  // time — but a group deleted between two polls can, and the honest answer is
-  // the workspace level rather than a row with no label.
-  if (group === undefined) return [root]
-  return [root, { key: group.id, label: group.name, order: group.order }]
+  // A live group is a Human placement and carries its own workspace, so the ROOT
+  // row comes from the group rather than from the placement: a placement whose
+  // workspace is the undecided sentinel still renders where its group lives, and
+  // the sentinel rule below never swallows a real grouping. A dangling group
+  // reference cannot reach here — the host resolves it at read time — but a group
+  // deleted between two polls can, and the honest answer is the workspace level
+  // rather than a row with no label.
+  const group = placement.group === undefined
+    ? undefined
+    : map.groups.find(candidate => candidate.id === placement.group)
+  if (group !== undefined) {
+    return [
+      { key: workspaceKey(group.workspace), label: group.workspace },
+      { key: group.id, label: group.name, order: group.order },
+    ]
+  }
+  // The undecided sentinel is not a row of its own. A Session the classifier
+  // could not decide leaves the plugin grouping exactly like an unclassified
+  // one, so it lands where dsh itself puts an unclaimed Session — the core
+  // Workspace grouping — instead of inventing an `unknown workspace` row. The
+  // label is read from the payload this Session was placed by, never a literal.
+  if (placement.workspace === map.unknownLabel) return undefined
+  return [{ key: workspaceKey(placement.workspace), label: placement.workspace }]
+}
+
+/**
+ * The workspace the "New group" flow may default to for one Session.
+ *
+ * The undecided sentinel is not a workspace a group can live in: the flow
+ * inherits the placement's workspace, so on an undecided Session it would
+ * inherit the sentinel, create a group there, and recreate the very
+ * `unknown workspace` root row this grouping no longer serves. The Host refuses
+ * that write too, and this is what keeps the refusal unreachable in normal use.
+ * @param map - the last map read, or undefined before the first.
+ * @param sessionId - the Session the menu belongs to.
+ * @returns the default target, or undefined to require an explicit choice.
+ */
+export function newGroupTarget(map: MapPayload | undefined, sessionId: string): string | undefined {
+  const workspace = map?.sessions[sessionId]?.workspace
+  if (workspace === undefined) return undefined
+  return workspace === map?.unknownLabel ? undefined : workspace
 }

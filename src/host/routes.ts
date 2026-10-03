@@ -230,6 +230,14 @@ async function applyGroupOperation(deps: FencedRouteDeps, input: GroupOperation)
       if (workspace === undefined || name === undefined) {
         return refuse(400, 'INVALID_INPUT', 'group.create requires a non-blank workspace and name')
       }
+      // The undecided sentinel is not a workspace: a group under it would render
+      // the `unknown workspace` root row the grouping deliberately stops serving,
+      // and the browser half's chooser cannot default to it either. Assignments
+      // still accept it — that is exactly how a Session is RELEASED to the core
+      // grouping — so the refusal is scoped to group creation.
+      if (workspace === deps.unknownLabel()) {
+        return refuse(400, 'UNKNOWN_WORKSPACE', `group.create refuses the undecided workspace "${workspace}"`)
+      }
       const group = await deps.store.createGroup({ workspace, name })
       return ok({ group, map: deps.map() })
     }

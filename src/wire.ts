@@ -141,9 +141,11 @@ export interface MapPayload {
   readonly groups: readonly GroupRecord[]
   /**
    * The closed candidate label set: the directories discovered under the
-   * workspaces root, plus the configured list, plus the unknown label. This is
-   * the set the sidebar's "Move to workspace…" chooser offers, and the set the
-   * classifier prompt is built over.
+   * workspaces root, plus the configured list. This is the set the sidebar's
+   * "Move to workspace…" chooser offers, and the set the classifier prompt is
+   * built over. The undecided sentinel is deliberately NOT in it: it is the
+   * fallback ANSWER the classifier may give, never a workspace a Session is
+   * placed in or a group is created under.
    */
   readonly candidates: readonly string[]
   /** Label recorded for an undecidable answer. */

@@ -13,12 +13,25 @@
  * same identity to decide whether re-registering its provider — which recomputes
  * the whole tree — is warranted.
  *
+ * Two orderings are settled here rather than left to luck:
+ *
+ * - **Every request is numbered as it is sent, and a write response sets a
+ *   barrier.** A poll whose request went out at or before that barrier answered
+ *   from the state the write replaced, so its response is dropped instead of
+ *   applying a stale tree on top of the new one. Nothing here is persisted, so a
+ *   host restart needs no special case: the first poll after it is simply newer
+ *   than the barrier.
+ * - **A Human placement is an OVERLAY over whatever map is current until its
+ *   write settles.** A poll answering while the write is in flight therefore
+ *   cannot displace it, and a refused write drops the overlay instead of
+ *   restoring a snapshot the poll has already superseded.
+ *
  * @module dsh-session-workspaces/client/state
  */
 
 import { MAP_CACHE_KEY, MAP_POLL_INTERVAL_MS } from '../config.ts'
 import { readMap } from './api.ts'
-import type { MapPayload } from '../wire.ts'
+import type { AssignmentRequest, MapPayload, SessionPlacement } from '../wire.ts'
 
 /**
  * Where the last map is kept between page loads.
@@ -67,29 +80,66 @@ export const browserMapCache: MapCache = {
 export interface MapState {
   /** `loading` before the first answer, `ready` while one stands, `error` after a failed read. */
   readonly status: 'loading' | 'ready' | 'error'
-  /** The last good map. */
+  /** The last good map, with any pending Human placement applied. */
   readonly map: MapPayload | undefined
   /** The last failure's message, while one stands. */
   readonly error: string | undefined
+}
+
+/** One Human placement shown over the map until its write settles. */
+interface PendingPlacement {
+  /** The Session being moved. */
+  readonly sessionId: string
+  /** What the Session looks like while the write is in flight. */
+  readonly placement: SessionPlacement
+}
+
+/**
+ * The placement one assignment shows before the Host answers.
+ *
+ * A Human assignment is a pin by definition, and a request that names a group
+ * carries the group's own workspace — the pair the host store resolves the write
+ * to — so the projection is the request's own fields.
+ * @param request - the assignment being posted.
+ * @returns the placement to show until the write settles.
+ */
+export function optimisticPlacement(request: AssignmentRequest): SessionPlacement {
+  return request.group === undefined
+    ? { workspace: request.workspace, pinned: true }
+    : { workspace: request.workspace, group: request.group, pinned: true }
 }
 
 /** A pollable, subscribable view of the host's map. */
 export class MapStore {
   private readonly listeners = new Set<() => void>()
   private readonly cache: MapCache
+  private readonly fetchMap: () => Promise<MapPayload>
   private state: MapState = { status: 'loading', map: undefined, error: undefined }
-  private signature: string | undefined
+  /** The last map as the Host answered it, without any overlay. */
+  private raw: MapPayload | undefined
+  private rawSignature: string | undefined
+  /** Signature of the projection last published, so an unchanged map never republishes. */
+  private published: string | undefined
+  private overlay: PendingPlacement | undefined
   private inFlight = false
+  /** How many requests this store has sent. */
+  private sent = 0
+  /** Highest request number a write response has superseded. */
+  private barrier = 0
 
   /**
    * @param cache - where the last map is kept between page loads.
+   * @param fetchMap - the fenced map read; injected so a spec can order answers.
    */
-  constructor(cache: MapCache = browserMapCache) {
+  constructor(cache: MapCache = browserMapCache, fetchMap: () => Promise<MapPayload> = readMap) {
     this.cache = cache
+    this.fetchMap = fetchMap
     const seed = cache.read()
     if (seed !== undefined) {
+      this.raw = seed
+      this.rawSignature = JSON.stringify(seed)
+      this.published = this.rawSignature
       this.state = { status: 'ready', map: seed, error: undefined }
-      this.signature = JSON.stringify(seed)
     }
   }
 
@@ -106,7 +156,7 @@ export class MapStore {
     return () => { this.listeners.delete(listener) }
   }
 
-  /** The last good map, for the synchronous grouping provider. */
+  /** The last good map — with any pending placement applied — for the synchronous grouping provider. */
   payload(): MapPayload | undefined {
     return this.state.map
   }
@@ -117,11 +167,48 @@ export class MapStore {
    */
   accept(map: MapPayload): void {
     const signature = JSON.stringify(map)
-    if (signature === this.signature) return
-    this.signature = signature
-    this.state = { status: 'ready', map, error: undefined }
-    this.cache.write(map)
-    this.publish()
+    if (signature !== this.rawSignature) {
+      this.rawSignature = signature
+      this.raw = map
+      this.cache.write(map)
+    }
+    // Re-projected rather than published verbatim: a pending Human placement
+    // outranks whatever map this answer carries until its write settles.
+    this.reproject()
+  }
+
+  /**
+   * Post one Human assignment and show it over the current map until it settles.
+   *
+   * The optimistic placement is an OVERLAY, never a snapshot of the map: a poll
+   * that lands while the write is in flight replaces the raw map underneath and
+   * leaves the placement standing, and a refused write drops the overlay — so
+   * the Session returns to whatever the CURRENT map says, which is exactly what a
+   * rollback of a snapshot would have got wrong.
+   * @param input - the assignment and the fenced call that posts it.
+   * @returns the map the Host answered with.
+   */
+  async assign(input: {
+    readonly request: AssignmentRequest
+    readonly send: () => Promise<MapPayload>
+  }): Promise<MapPayload> {
+    this.overlay = { sessionId: input.request.sessionId, placement: optimisticPlacement(input.request) }
+    this.reproject()
+    this.sent += 1
+    try {
+      const map = await input.send()
+      // The barrier covers every request sent up to this instant — including a
+      // poll that was in flight when the write landed, whose answer was sampled
+      // from the state the write replaced.
+      this.barrier = this.sent
+      this.overlay = undefined
+      this.accept(map)
+      return map
+    } catch (error) {
+      this.overlay = undefined
+      this.reproject()
+      throw error
+    }
   }
 
   /**
@@ -131,15 +218,20 @@ export class MapStore {
   async refresh(): Promise<void> {
     if (this.inFlight) return
     this.inFlight = true
+    this.sent += 1
+    const seq = this.sent
     try {
-      this.accept(await readMap())
+      const map = await this.fetchMap()
+      // A response to a request that was already in flight when a write landed is
+      // not authoritative: it answers from the state that write replaced.
+      if (seq > this.barrier) this.accept(map)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       // A failed poll keeps the last good map standing: a transient read failure
       // must not empty the tree. Only a store that never had one reports error.
-      this.state = this.state.map === undefined
+      this.state = this.raw === undefined
         ? { status: 'error', map: undefined, error: message }
-        : { status: 'ready', map: this.state.map, error: message }
+        : { status: 'ready', map: this.project(), error: message }
       this.publish()
     } finally {
       this.inFlight = false
@@ -149,6 +241,27 @@ export class MapStore {
   /** Notify every subscriber of the current snapshot. */
   private publish(): void {
     for (const listener of [...this.listeners]) listener()
+  }
+
+  /** The map as published: the raw answer, with a pending Human placement over it. */
+  private project(): MapPayload | undefined {
+    if (this.raw === undefined || this.overlay === undefined) return this.raw
+    return {
+      ...this.raw,
+      sessions: { ...this.raw.sessions, [this.overlay.sessionId]: this.overlay.placement },
+    }
+  }
+
+  /** Publish the projection of the raw map and the overlay — and only when it really changed. */
+  private reproject(): void {
+    const projected = this.project()
+    const signature = projected === undefined
+      ? undefined
+      : projected === this.raw ? this.rawSignature : JSON.stringify(projected)
+    if (signature === this.published) return
+    this.published = signature
+    this.state = { status: 'ready', map: projected, error: undefined }
+    this.publish()
   }
 }
 
@@ -162,14 +275,15 @@ export interface MapPolling {
 
 /**
  * Start polling the host's map.
- * @param options - poll interval override, for tests.
+ * @param options - poll interval and injected ports, for tests.
  * @returns the store and the disposer.
  */
 export function startMapPolling(options: {
   readonly intervalMs?: number | undefined
   readonly cache?: MapCache | undefined
+  readonly fetchMap?: (() => Promise<MapPayload>) | undefined
 } = {}): MapPolling {
-  const store = new MapStore(options.cache ?? browserMapCache)
+  const store = new MapStore(options.cache ?? browserMapCache, options.fetchMap)
   void store.refresh()
   const timer = setInterval(() => { void store.refresh() }, options.intervalMs ?? MAP_POLL_INTERVAL_MS)
   // Node answers a Timeout object and the DOM a number, and this module compiles

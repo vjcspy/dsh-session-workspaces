@@ -11,6 +11,11 @@
  * re-registers the provider, which moves the seam's revision and repaints the
  * tree once. That is what makes a classification land without a refresh.
  *
+ * The provider also receives the sidebar's Session drops: a drop onto one of its
+ * rows is the same Human assignment the menu writes, and a drop of one of its
+ * Sessions onto a core row pins the undecided sentinel, which releases the
+ * Session back to the core grouping without a second model call.
+ *
  * Every registration is an effect of this context, so a plugin unload removes the
  * provider, the poll and the surfaces with it.
  *
@@ -32,13 +37,14 @@ import {
   backfill as backfillRequest, createGroup as createGroupRequest, mutate as mutateRequest, readCatalog,
 } from './api.ts'
 import { en } from './locales.ts'
-import { registerGroupingProvider, type GroupingSeam } from './provider.ts'
+import { registerGroupingProvider, type GroupingSeam, type GroupingWritePort } from './provider.ts'
 import { RouteCatalogState, type RouteCatalogSnapshot } from './route-catalog.ts'
 import {
   MoveToGroupItem, MoveToWorkspaceItem, NewGroupItem, RemoveFromGroupItem, type SessionMenuInjected,
 } from './SessionMenuItems.tsx'
 import { SessionWorkspacesSettings, type SettingsInjected, type SettingsView } from './SettingsSection.tsx'
 import { startMapPolling } from './state.ts'
+import { isGroupOperation } from '../wire.ts'
 import type { BackfillStatus, MapPayload } from '../wire.ts'
 
 /** Services this half reads; all three are shell-provided. */
@@ -71,11 +77,20 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => () => { polling.dispose() }, `${GROUPING_PROVIDER_ID}: map poll`)
 
   // The write faces: each folds the map its response carries into the store, so
-  // the tree and the settings card move on the response itself.
+  // the tree and the settings card move on the response itself. An ASSIGNMENT is
+  // also shown over the map while its write is in flight, so a drop or a menu
+  // move is visible immediately and a refused write rolls back to whatever the
+  // current map says; a group operation has no single Session to project and
+  // waits for its answer.
+  const write = (body: Parameters<SessionMenuInjected['mutate']>[0]): Promise<void> =>
+    isGroupOperation(body)
+      ? mutateRequest(body).then((map) => { polling.store.accept(map) })
+      : polling.store.assign({ request: body, send: () => mutateRequest(body) }).then(() => undefined)
+
   const menuFace = (): SessionMenuInjected => ({
     read: polling.store.read,
     subscribe: polling.store.subscribe,
-    mutate: async (body) => { polling.store.accept(await mutateRequest(body)) },
+    mutate: write,
     createGroup: async (input) => {
       const created = await createGroupRequest(input)
       polling.store.accept(created.map)
@@ -89,11 +104,19 @@ export function apply(ctx: ClientContext): void {
   if (seam === undefined) {
     ctx.logger.warn(`${GROUPING_PROVIDER_ID}: the client grouping seam is not mounted; grouping stays core-only`)
   } else {
+    // The drop path: one Human assignment per drop, through the SAME fenced write
+    // the menu uses. Declaring it is what makes a row of this provider a drop
+    // target — the seam refuses a move no provider can apply.
+    const dropWrite: GroupingWritePort = {
+      assign: async (request) => { await write(request) },
+    }
     ctx.effect(() => {
       const registration = registerGroupingProvider({
         seam,
         store: polling.store,
         providerId: GROUPING_PROVIDER_ID,
+        write: dropWrite,
+        log: (message) => { ctx.logger.warn(message) },
       })
       return () => { registration.dispose() }
     }, `${GROUPING_PROVIDER_ID}: grouping provider`)
