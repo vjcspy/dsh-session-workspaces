@@ -41,8 +41,8 @@ before restarting; a `file:` install is a hardlink tree, so a rebuild needs
 
 The plugin needs the client grouping seam (`ctx.workspaceGrouping`) from
 `deepseek-harness` `packages/client/ui-workspace`, i.e. `develop` at
-`0ce400ab5f883656de6ca03508cb57a3d7c16ee4` or later. Without it the browser half
-logs one warning and the tree stays on core grouping; the host half still runs.
+`5611288ef2` or later. Without it the browser half logs one warning and the tree
+stays on core grouping; the host half still runs.
 
 ## What the host half does
 
@@ -110,7 +110,11 @@ Three properties are contractual:
 The answer is validated against a **closed candidate set** — the directories under
 the Aweave `workspaces/` root (located from the Sessions' own working
 directories, or set by `workspacesRoot`) plus the configured list — and a
-below-threshold or out-of-set answer becomes the configured unknown label.
+below-threshold or out-of-set answer becomes the configured unknown label. That
+label is a recorded **decision**, not a bucket: the sentinel is written like any
+other label, so the Session is never re-decided and costs no second call — while
+the browser half serves no row for it, so the Session renders where dsh puts an
+unclaimed Session, under the core Workspace grouping.
 Provider error, deadline or unparseable output records nothing and does not
 disturb the Session, its turn, or the core title feature.
 
@@ -297,11 +301,27 @@ remote adapter's model list is a network round trip.
 Moving a Session into a group **owned by another workspace** moves the Session's
 workspace too, in the same write: the group record carries its workspace.
 
+Dropping a Session this plugin claimed onto a **core** row — a Workspace, or
+`Ungrouped` — is a **release**: the browser posts
+`{sessionId, workspace: <the undecided sentinel>}` with **no** group, which pins
+the sentinel and lets the Session fall back to the core grouping without a second
+model call. The write route accepts it — a plain assignment checks nothing about
+the workspace beyond it being non-blank — while `group.create` **refuses** the
+sentinel workspace with `UNKNOWN_WORKSPACE`, because a group under it would
+recreate the `unknown workspace` root row the grouping deliberately stopped
+serving. That asymmetry is what makes the release possible: the sentinel is
+assignable, and only group creation is fenced from it.
+
 ## The browser half
 
 The map is polled every 4 s (there is no push), and the grouping provider answers
 a root-to-leaf path: `workspace › group` when a group exists, `workspace` alone
-otherwise, and `undefined` for an unclassified Session so core grouping applies.
+otherwise, and `undefined` in two cases — an unclassified Session, and a Session
+whose classification recorded the undecided sentinel (the classifier could not
+decide, answered outside the candidate set, or answered below the confidence
+threshold) — so core grouping applies to both. The provider also declares the
+seam's `drop` handler, which is what makes its rows drop targets and what
+carries a move or a release to [the fenced write](#fenced-routes).
 
 Two implementation notes that are load-bearing rather than stylistic:
 
@@ -315,27 +335,31 @@ Two implementation notes that are load-bearing rather than stylistic:
   A reload renders before the first map read resolves, and without a
   synchronously available map the provider produces no rows on that render.
 
-### Reload persistence (seam-owned; fixed in `deepseek-harness` `45ac428677`)
+### Reload persistence (seam-owned; fixed in `deepseek-harness` `bd44518c48`)
 
 Earlier builds pruned a provider group's persisted collapsed state and manual order
 on the render that runs before this plugin's client bundle has registered its
 provider (~60 ms after DOMContentLoaded), so a provider group reloaded expanded and
 lost its saved Session order. **That is fixed in the seam**: since
-`deepseek-harness` `0003b94848` retention is ownership-scoped — it prunes only the
+`deepseek-harness` `49e9ef006e` retention is ownership-scoped — it prunes only the
 keys the browser owns itself and leaves every key namespaced by a provider id
 (`<providerId>:…`) untouched, registered or not.
 
 Re-verified in a real browser against this plugin at `c939db4f` on
-`deepseek-harness` `45ac428677`: a collapsed provider workspace row and its collapsed
+`deepseek-harness` `bd44518c48`: a collapsed provider workspace row and its collapsed
 nested group both reloaded collapsed (`aria-expanded="false"`), and the group's
 `sessionOrderByAccount` entry survived the reload.
 
-One gap in the same area remains, and it is core, not this plugin: a manual drag
-**inside** a provider group does not reorder its members. `WorkspaceBrowser`'s
-`commitSessionDrag` resolves the dragged account to `ungroupedSessionIds` or a
-Workspace `sessionIds` and returns early for any other account key, so the drag is
-discarded — the same synthetic drag reorders the flat list correctly, and a provider
-group's recorded order therefore always mirrors its natural order.
+A manual drag **inside** a provider row is deliberately **not** a reorder: the
+seam gives a provider row no in-row order — its members render in the provider's
+own membership order — so its same-row insert marker is suppressed and a same-row
+drag commits nothing, while the same synthetic drag still reorders a Workspace or
+`Ungrouped` row. A drop on **another** row is a cross-row drop, and that one is a
+**move**: `WorkspaceGrouping.canDrop` decides whether a provider owns it,
+`WorkspaceGrouping.drop` routes it to that provider, and this plugin's
+`GroupingProvider.drop` posts the resulting assignment to its fenced write.
+Releasing a claimed Session onto a **core** row is the same path with a different
+target — see [Fenced routes](#fenced-routes).
 
 ## Settings
 
@@ -343,6 +367,13 @@ group's recorded order therefore always mirrors its natural order.
 `<select>` for the classification route, the additional candidate list (with the
 discovered labels shown read-only), the unknown label, the minimum confidence, and
 the backfill action.
+
+The unknown label is a **decision sentinel**, not a display bucket. It is the
+label recorded when the classifier cannot decide, so a Session carrying it is
+decided and never re-decided; it is not rendered as a row of its own, because the
+browser half leaves such a Session on the core grouping; and it is the workspace
+value a **release** writes when a claimed Session is dropped back onto a core row
+([Fenced routes](#fenced-routes)).
 
 The route control replaces the separate `provider` and `model` text fields and
 offers, in order:
