@@ -68,6 +68,42 @@ export interface SessionPlacement {
   readonly pinned: boolean
 }
 
+/**
+ * Why a pass's failures happened, one count per class.
+ *
+ * The three model classes are the classifier's OWN reasons (see
+ * `classifier.ts`: `timeout`, `provider-error`, `malformed`), kept apart
+ * because each needs a different remedy — a longer deadline, a route or quota
+ * fix, or prompt framing. `read` and `route` are the two exits that never
+ * reach a model, and `other` is anything else the pass caught. A single
+ * coarse "model failed" bucket would make a mixed pass as undiagnosable as
+ * the one overwritten string it replaces.
+ */
+export interface BackfillFailureTally {
+  /** The stored log could not be read. */
+  readonly read: number
+  /** No classification route resolved, so no model call was made. */
+  readonly route: number
+  /** The classifier's own deadline fired. */
+  readonly timeout: number
+  /** The stream threw, or reported a terminal provider failure. */
+  readonly providerError: number
+  /** The model's answer carried no usable label. */
+  readonly malformed: number
+  /** Anything else the pass caught around those. */
+  readonly other: number
+}
+
+/** One failure a pass recorded, newest first. In memory only, never persisted. */
+export interface BackfillFailure {
+  /** The Session whose classification failed. */
+  readonly sessionId: string
+  /** Which class of {@link BackfillFailureTally} it was counted in. */
+  readonly kind: keyof BackfillFailureTally
+  /** The Session id and the failure's message, truncated to 200 characters. */
+  readonly message: string
+}
+
 /** Progress of the opt-in backfill, as the settings section reports it. */
 export interface BackfillStatus {
   /** True while a backfill pass is walking the corpus. */
@@ -77,24 +113,50 @@ export interface BackfillStatus {
   /**
    * How many stored top-level Sessions are still undecided, sampled by the host.
    *
-   * This is the cost the settings section states before a pass starts: one model
-   * call per undecided Session.
+   * A SAMPLE, not the pass's target list: any open page refreshes it on a short
+   * TTL, while `start()` re-lists its targets at the moment of the pass. So it
+   * bounds nothing: a pass spends one model call only on the Sessions whose
+   * stored log holds a human prompt.
    */
   readonly pending: number
   /** How many of those it has finished (classified, skipped or failed). */
   readonly done: number
   /** How many Sessions it recorded a label for. */
   readonly classified: number
+  /**
+   * How many of {@link BackfillStatus.classified} stored the configured unknown label.
+   *
+   * A SUBSET field, never a redefinition: a write that fell back to the sentinel
+   * is still a write, but `unknown === classified` means the pass placed nothing.
+   */
+  readonly unknown: number
   /** How many Sessions it could not classify (no route, provider error, malformed answer). */
   readonly failed: number
+  /** How many failures each class accounts for. Zero in the classes that did not occur. */
+  readonly failures: BackfillFailureTally
   /** How many it skipped because they were already classified or pinned. */
   readonly skipped: number
+  /**
+   * How many Sessions it read whose stored log holds no human prompt.
+   *
+   * Its own outcome, never a failure: reading such a Session costs one log read
+   * and no model call. Not a permanent verdict either — a stored Session can
+   * gain its first prompt later, so it stays a target of every pass.
+   */
+  readonly noPrompt: number
   /** ISO instant the last pass started, when one has. */
   readonly startedAt?: string | undefined
   /** ISO instant the last pass finished, when one has. */
   readonly finishedAt?: string | undefined
   /** The last failure's reason, for the settings section to show. */
   readonly lastError?: string | undefined
+  /**
+   * The most recent failures, newest first, capped by the host.
+   *
+   * The tally is the stable signal; this list is what names the Sessions. Both
+   * live as long as `lastError` does — in memory, for the life of the process.
+   */
+  readonly recentFailures: readonly BackfillFailure[]
 }
 
 /** One advertised route: a provider and one model that provider advertises. */

@@ -69,18 +69,23 @@ export const en = {
   'settings.failed': 'The Host refused the write: {message}',
   'settings.unavailable': 'This deployment does not expose the plugin\'s configuration to the browser.',
 
-  // Backfill.
+  // Backfill. Every cost claim below is true by construction: a pass spends one
+  // model call per Session whose log holds a human prompt, and `pending` is a
+  // sample, so it is never stated as a bound.
   'backfill.heading': 'Classify existing Sessions',
-  'backfill.explain': 'Sessions created before this plugin was enabled keep their core group. Classifying them costs {count} model call(s) — one per Session — and skips anything already decided or pinned.',
-  'backfill.start': 'Classify {count} Session(s)',
-  'backfill.confirm': 'This spends {count} model call(s). Continue?',
+  'backfill.explain': '{count} stored Session(s) are undecided (sampled). A pass reads each one and spends one model call only on those whose log holds a human prompt.',
+  'backfill.start': 'Start a pass over {count} undecided Session(s)',
+  'backfill.confirm': 'This reads {count} undecided Session(s) and spends at most one model call on each that has a human prompt. Continue?',
   'backfill.confirmYes': 'Yes, start',
   'backfill.confirmNo': 'Cancel',
   'backfill.none': 'Every stored Session is already decided.',
-  'backfill.running': 'Running — {done} of {total} done, {classified} classified, {failed} failed.',
-  'backfill.done': 'Last pass: {classified} classified, {skipped} skipped, {failed} failed.',
+  'backfill.running': 'Running — {done} of {total} done, {classified} classified ({unknown} fell to the unknown group), {failed} failed, {noPrompt} with no human prompt.',
+  'backfill.done': 'Last pass: {classified} classified ({unknown} fell to the unknown group), {skipped} skipped, {failed} failed, {noPrompt} with no human prompt.',
   'backfill.never': 'No pass has run yet.',
   'backfill.lastError': 'Last failure: {message}',
+  'backfill.failures': 'Failures by reason: {read} unreadable log(s), {route} with no route, {timeout} timed out, {providerError} provider error(s), {malformed} malformed answer(s), {other} other.',
+  'backfill.recentHeading': 'Recent failures',
+  'backfill.recentRow': '{kind}: {message}',
 } satisfies Record<string, string>
 
 /** Every key this plugin's dictionary defines. */

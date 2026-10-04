@@ -138,7 +138,12 @@ describe('the map a read publishes', () => {
     const map = store.snapshot({
       candidates: ['k', 'tinybots'],
       unknownLabel: 'unknown workspace',
-      backfill: { running: false, total: 0, pending: 3, done: 0, classified: 0, failed: 0, skipped: 0 },
+      backfill: {
+        running: false, total: 0, pending: 3, done: 0, classified: 0, unknown: 0, failed: 0, skipped: 0,
+        noPrompt: 0,
+        failures: { read: 0, route: 0, timeout: 0, providerError: 0, malformed: 0, other: 0 },
+        recentFailures: [],
+      },
       titleProvider: 'unavailable',
     })
     expect(Object.keys(map.sessions).sort()).toEqual(['s1', 's2'])

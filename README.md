@@ -410,11 +410,14 @@ without a restart, and clearing them made the Session after that classify again.
 Existing Sessions keep the core fallback group until they are classified. The
 settings section offers an explicit, Human-triggered pass that:
 
-- states its cost before it starts — one model call per undecided Session — and
-  requires a second confirmation;
+- states its cost before it starts — one model call per Session it decides to
+  classify, i.e. per Session whose stored log holds a human prompt; the undecided
+  count it names is a sample — and requires a second confirmation;
 - reads each stored Session's first Human prompt through
   `ctx.sessionQuery.readSession`, which replays the stored log without resuming
-  the Session, and takes the route from that Session's own last `request/header`;
+  the Session, and takes the route from the configured `provider`/`model` pair,
+  falling back to that Session's own last `request/header` only while both are
+  empty (`resolveRoute`);
 - never runs automatically;
 - bounds concurrency (`BACKFILL_CONCURRENCY`, default 2);
 - resumes by skipping every Session that already carries a label or a pin, so a
@@ -435,8 +438,9 @@ await ONE keyed decision. A Human-triggered backfill breaks it in two ways:
   no label, so a decision that failed and was never persisted is attempted again
   on the next pass instead of being remembered as attempted.
 
-The cost stays bounded (the pass states one call per *undecided* Session and
-requires a second confirmation), and only the Human-triggered path is affected:
+The cost stays bounded (the pass spends at most one call per Session it decides
+to classify and requires a second confirmation), and only the Human-triggered path
+is affected:
 no automatic path runs a second call for a Session.
 
 ## Gates

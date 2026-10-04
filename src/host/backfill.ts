@@ -15,6 +15,13 @@
  *   is never considered, so re-running a pass costs nothing for settled work and
  *   the core fallback group is left alone until each Session is classified.
  *
+ * - **It reports what it actually did.** A Session whose stored log holds no
+ *   human prompt is its own outcome, never a failure — that is a property of the
+ *   log as it stands, and a stored Session can gain its first prompt later. Every
+ *   failure is counted under the classifier's own reason, beside a bounded
+ *   in-memory list, because two failures in flight overwrite the single
+ *   `lastError` string in a scheduling-dependent order.
+ *
  * Concurrency is bounded, and a failure is recorded, never thrown: one
  * unanswerable Session must not abort the pass.
  *
@@ -23,13 +30,19 @@
 
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { BACKFILL_CONCURRENCY } from '../config.ts'
-import type { BackfillStatus } from '../wire.ts'
+import type { BackfillFailure, BackfillFailureTally, BackfillStatus } from '../wire.ts'
 import { classify, resolveRoute } from './classifier.ts'
 import { firstHumanPrompt, routeFromEvents, type LoggedEvent } from './session-log.ts'
 import type { WorkspaceStore } from './store.ts'
 
 /** How stale the sampled `pending` count may be before a poll refreshes it. */
 const PENDING_TTL_MS = 15_000
+
+/** How many recent failures the snapshot keeps, newest first. */
+const RECENT_FAILURES_CAP = 10
+
+/** Longest message kept in the in-memory list, counted AFTER the Session id prefix. */
+const RECENT_FAILURE_CHARS = 200
 
 /** One Session the corpus reports. */
 export interface StoredSessionRecord {
@@ -84,7 +97,8 @@ export class Backfill {
   constructor(deps: BackfillDeps) {
     this.deps = deps
     this.progress = {
-      running: false, total: 0, pending: 0, done: 0, classified: 0, failed: 0, skipped: 0,
+      running: false, total: 0, pending: 0, done: 0, classified: 0, unknown: 0, failed: 0, skipped: 0,
+      noPrompt: 0, failures: noFailures(), recentFailures: [],
     }
   }
 
@@ -123,13 +137,15 @@ export class Backfill {
     this.pendingSampledAt = Date.now()
     if (targets.length === 0) {
       this.progress = {
-        ...this.progress, running: false, total: 0, pending: 0, done: 0, classified: 0, failed: 0, skipped,
+        ...this.progress, running: false, total: 0, pending: 0, done: 0, classified: 0, unknown: 0, failed: 0,
+        skipped, noPrompt: 0, failures: noFailures(), recentFailures: [],
         startedAt: now, finishedAt: this.now(), lastError: undefined,
       }
       return this.snapshot()
     }
     this.progress = {
-      running: true, total: targets.length, pending: targets.length, done: 0, classified: 0, failed: 0, skipped,
+      running: true, total: targets.length, pending: targets.length, done: 0, classified: 0, unknown: 0,
+      failed: 0, skipped, noPrompt: 0, failures: noFailures(), recentFailures: [],
       startedAt: now,
     }
     this.running = true
@@ -169,12 +185,28 @@ export class Backfill {
         this.progress = { ...this.progress, done: this.progress.done + 1, skipped: this.progress.skipped + 1 }
         return
       }
-      const snapshot = await this.deps.readSession(sessionId)
-      const prompt = firstHumanPrompt(snapshot.events)
-      if (prompt === undefined) {
+      let snapshot: { readonly events: readonly LoggedEvent[] }
+      try {
+        snapshot = await this.deps.readSession(sessionId)
+      } catch (error) {
+        // A read failure is its own class, and it keeps the diagnostic the outer
+        // catch writes: `log` is the only sink a read failure has.
+        const message = messageOf(error)
         this.progress = {
           ...this.progress, done: this.progress.done + 1, failed: this.progress.failed + 1,
-          lastError: `${sessionId}: no human prompt in its stored log`,
+          lastError: `${sessionId}: ${message}`,
+          failures: countFailure(this.progress.failures, 'read'),
+          recentFailures: recordFailure(this.progress.recentFailures, sessionId, 'read', message),
+        }
+        this.deps.log(`dsh-session-workspaces: backfill failed for ${sessionId}: ${message}`)
+        return
+      }
+      const prompt = firstHumanPrompt(snapshot.events)
+      if (prompt === undefined) {
+        // Not a failure: this log holds no human prompt today, and it stays a
+        // target of every later pass because a stored Session can gain one.
+        this.progress = {
+          ...this.progress, done: this.progress.done + 1, noPrompt: this.progress.noPrompt + 1,
         }
         return
       }
@@ -184,9 +216,12 @@ export class Backfill {
         routeFromEvents(snapshot.events),
       )
       if (route.source === 'none') {
+        const message = "no route — set provider and model in this plugin's settings"
         this.progress = {
           ...this.progress, done: this.progress.done + 1, failed: this.progress.failed + 1,
-          lastError: `${sessionId}: no route — set provider and model in this plugin's settings`,
+          lastError: `${sessionId}: ${message}`,
+          failures: countFailure(this.progress.failures, 'route'),
+          recentFailures: recordFailure(this.progress.recentFailures, sessionId, 'route', message),
         }
         return
       }
@@ -200,25 +235,36 @@ export class Backfill {
         ...this.deps.timeoutMs === undefined ? {} : { timeoutMs: this.deps.timeoutMs },
       })
       if (!outcome.ok) {
+        const message = `${outcome.reason} — ${outcome.message}`
         this.progress = {
           ...this.progress, done: this.progress.done + 1, failed: this.progress.failed + 1,
-          lastError: `${sessionId}: ${outcome.reason} — ${outcome.message}`,
+          lastError: `${sessionId}: ${message}`,
+          failures: countFailure(this.progress.failures, outcome.reason),
+          recentFailures: recordFailure(this.progress.recentFailures, sessionId, outcome.reason, message),
         }
         return
       }
       const written = await store.recordLabel(sessionId, outcome.label, outcome.confidence)
+      // The sentinel is a real write, so it stays inside `classified`; the subset
+      // is what tells a placement from a fallback. Nothing was written when the
+      // store refused (the Session was pinned in flight), so `unknown` stays put.
+      const unknown = written && outcome.label === live.unknownLabel ? 1 : 0
       this.progress = {
         ...this.progress,
         done: this.progress.done + 1,
         classified: this.progress.classified + (written ? 1 : 0),
+        unknown: this.progress.unknown + unknown,
         skipped: this.progress.skipped + (written ? 0 : 1),
       }
     } catch (error) {
+      const message = messageOf(error)
       this.progress = {
         ...this.progress, done: this.progress.done + 1, failed: this.progress.failed + 1,
-        lastError: `${sessionId}: ${messageOf(error)}`,
+        lastError: `${sessionId}: ${message}`,
+        failures: countFailure(this.progress.failures, 'other'),
+        recentFailures: recordFailure(this.progress.recentFailures, sessionId, 'other', message),
       }
-      this.deps.log(`dsh-session-workspaces: backfill failed for ${sessionId}: ${messageOf(error)}`)
+      this.deps.log(`dsh-session-workspaces: backfill failed for ${sessionId}: ${message}`)
     }
   }
 
@@ -250,4 +296,68 @@ export class Backfill {
  */
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Every failure class the backfill can produce: the classifier's own three
+ * reasons, plus the two exits that never reach a model and the outer catch.
+ */
+type FailureReason = 'read' | 'route' | 'timeout' | 'provider-error' | 'malformed' | 'other'
+
+/**
+ * The tally a fresh pass starts from.
+ * @returns every class at zero.
+ */
+function noFailures(): BackfillFailureTally {
+  return { read: 0, route: 0, timeout: 0, providerError: 0, malformed: 0, other: 0 }
+}
+
+/**
+ * The tally key one failure reason is counted under.
+ * @param reason - the reason, in the vocabulary its producer uses.
+ * @returns the key of {@link BackfillFailureTally} it belongs to.
+ */
+function tallyKey(reason: FailureReason): keyof BackfillFailureTally {
+  return reason === 'provider-error' ? 'providerError' : reason
+}
+
+/**
+ * One more failure, counted in its own class.
+ *
+ * The tally is replaced with a spread, never mutated: it is part of a frozen
+ * wire object.
+ * @param tally - the tally as it stands.
+ * @param reason - the class the failure belongs to.
+ * @returns a new tally with that class one higher.
+ */
+function countFailure(tally: BackfillFailureTally, reason: FailureReason): BackfillFailureTally {
+  const key = tallyKey(reason)
+  return { ...tally, [key]: tally[key] + 1 }
+}
+
+/**
+ * One failure prepended to the bounded newest-first list.
+ *
+ * The message carries the Session id and is truncated AFTER that prefix, so the
+ * id always survives the cap. Callers build the counter and the list in ONE
+ * synchronous assignment: with two calls in flight, a read-modify-write across
+ * an `await` would drop one of them.
+ * @param previous - the list as it stands.
+ * @param sessionId - the Session that failed.
+ * @param reason - the class the failure belongs to.
+ * @param message - the failure's message, without the id prefix.
+ * @returns the new list, newest first, capped at {@link RECENT_FAILURES_CAP}.
+ */
+function recordFailure(
+  previous: readonly BackfillFailure[],
+  sessionId: string,
+  reason: FailureReason,
+  message: string,
+): readonly BackfillFailure[] {
+  const entry: BackfillFailure = {
+    sessionId,
+    kind: tallyKey(reason),
+    message: `${sessionId}: ${message}`.slice(0, RECENT_FAILURE_CHARS),
+  }
+  return [entry, ...previous].slice(0, RECENT_FAILURES_CAP)
 }

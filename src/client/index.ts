@@ -62,7 +62,10 @@ interface SettingsValues {
 
 /** A namespace view with nothing read yet. */
 const EMPTY_BACKFILL: BackfillStatus = {
-  running: false, total: 0, pending: 0, done: 0, classified: 0, failed: 0, skipped: 0,
+  running: false, total: 0, pending: 0, done: 0, classified: 0, unknown: 0, failed: 0, skipped: 0,
+  noPrompt: 0,
+  failures: { read: 0, route: 0, timeout: 0, providerError: 0, malformed: 0, other: 0 },
+  recentFailures: [],
 }
 
 /**

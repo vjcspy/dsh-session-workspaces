@@ -289,7 +289,9 @@ export function SessionWorkspacesSettings({
               done: String(view.backfill.done),
               total: String(view.backfill.total),
               classified: String(view.backfill.classified),
+              unknown: String(view.backfill.unknown),
               failed: String(view.backfill.failed),
+              noPrompt: String(view.backfill.noPrompt),
             })}
           </span>
         )}
@@ -297,8 +299,10 @@ export function SessionWorkspacesSettings({
           <span style={hint}>
             {t('backfill.done', {
               classified: String(view.backfill.classified),
+              unknown: String(view.backfill.unknown),
               skipped: String(view.backfill.skipped),
               failed: String(view.backfill.failed),
+              noPrompt: String(view.backfill.noPrompt),
             })}
           </span>
         )}
@@ -307,6 +311,26 @@ export function SessionWorkspacesSettings({
         )}
         {view.backfill.lastError !== undefined && (
           <span style={{ ...hint, ...danger }}>{t('backfill.lastError', { message: view.backfill.lastError })}</span>
+        )}
+        {view.backfill.failed > 0 && (
+          <div style={row}>
+            <span style={hint}>
+              {t('backfill.failures', {
+                read: String(view.backfill.failures.read),
+                route: String(view.backfill.failures.route),
+                timeout: String(view.backfill.failures.timeout),
+                providerError: String(view.backfill.failures.providerError),
+                malformed: String(view.backfill.failures.malformed),
+                other: String(view.backfill.failures.other),
+              })}
+            </span>
+            <span style={hint}>{t('backfill.recentHeading')}</span>
+            {view.backfill.recentFailures.map(failure => (
+              <span key={`${failure.sessionId}:${failure.message}`} style={{ ...hint, ...danger }}>
+                {t('backfill.recentRow', { kind: failure.kind, message: failure.message })}
+              </span>
+            ))}
+          </div>
         )}
         {view.backfill.pending === 0 && !view.backfill.running
           ? <span style={hint}>{t('backfill.none')}</span>
@@ -331,7 +355,8 @@ export function SessionWorkspacesSettings({
                   onClick={() => {
                     setConfirming(false)
                     void run(async () => { await startBackfill() }, t('backfill.running', {
-                      done: '0', total: String(view.backfill.pending), classified: '0', failed: '0',
+                      done: '0', total: String(view.backfill.pending), classified: '0', unknown: '0',
+                      failed: '0', noPrompt: '0',
                     }))
                   }}
                 >

@@ -29,7 +29,12 @@ function map(revision: string): MapPayload {
     groups: [{ id: 'g1', name: 'Release', workspace: 'k', createdAt: revision, order: 0 }],
     candidates: ['k'],
     unknownLabel: 'unknown workspace',
-    backfill: { running: false, total: 0, pending: 0, done: 0, classified: 0, failed: 0, skipped: 0 },
+    backfill: {
+      running: false, total: 0, pending: 0, done: 0, classified: 0, unknown: 0, failed: 0, skipped: 0,
+      noPrompt: 0,
+      failures: { read: 0, route: 0, timeout: 0, providerError: 0, malformed: 0, other: 0 },
+      recentFailures: [],
+    },
     titleProvider: 'ok',
   }
 }
